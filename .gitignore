@@ -32,3 +32,5 @@ data/
 gradio_cached_examples/
 tmp/
 *.log
+
+AiDigitalLibraryAssistant/
