@@ -144,6 +144,17 @@ INDIA_PATTERNS: List[PIIPattern] = [
         validator=verhoeff_valid, context_words=_GOV_CONTEXT, weak=False,
     ),
     PIIPattern(
+        # safety net: 12 digits that FAIL the Verhoeff checksum (typo, or a
+        # number typed from memory) but sit next to an Aadhaar keyword.
+        # Without this the raw digits would reach the agent unmasked, which is
+        # the wrong direction to fail in. Overlaps lose to the validated
+        # detector (priority mapping favors checksum matches).
+        entity="IN_AADHAAR_UNVERIFIED", label="Aadhaar Number (unverified)",
+        category="government_id",
+        pattern=_IN_AADHAAR_PATTERN, placeholder_prefix="AADHAAR",
+        context_words=_GOV_CONTEXT, weak=True,
+    ),
+    PIIPattern(
         entity="IN_PAN", label="PAN Card", category="government_id",
         pattern=_IN_PAN_PATTERN, placeholder_prefix="PAN",
     ),

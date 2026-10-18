@@ -193,6 +193,22 @@ class PIIService:
             patterns = [p for p in patterns if not p.entity.startswith("US_")]
         return patterns
 
+    @staticmethod
+    def _pattern_priority(pattern: "PIIPattern") -> float:
+        """Legacy tiering with one fix: checksum-validated strong on top.
+
+        3.5 checksum-validated strong (Aadhaar, credit cards): beats every
+               validator-less match overlapping the same span (e.g. the
+               unverified-Aadhaar safety net).
+        3.0  validator-less patterns (PAN, IFSC, phones, email, SSN, the
+               unverified-Aadhaar net, and context-confirmed weak ones) tie
+               here and are split by registry order (India before USA).
+        1.0  validator+weak (validator lowers a heuristic's claim tier).
+        """
+        if pattern.validator:
+            return 3.5 if not pattern.weak else 1.0
+        return 3.0
+
     def analyze(
         self,
         text: str,
@@ -232,8 +248,10 @@ class PIIService:
                     continue
                 if pattern.weak and not pattern.context_matches(_context_span(text, match_object.start(), match_object.end())):
                     continue
-                # priority: validated > strong > weak > rule index
-                priority = 3 if not pattern.validator else (2 if not pattern.weak else 1)
+                # priority matches the comment: validated-strong > strong |
+                # validated-weak > weak heuristic. A checksum-validated match
+                # must outrank an unverified fallback spanning the same digits.
+                priority = self._pattern_priority(pattern)
                 _emit(match_object, pattern, value, priority - index * 0.01)
 
         # custom rules

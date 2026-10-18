@@ -470,7 +470,7 @@ def perform_search(query, top_k):
 # ------------------------------------------------- PII Protection tab handlers
 
 PII_ENTITY_CHOICES = [
-    "EMAIL", "PHONE", "IN_AADHAAR", "IN_PAN", "IN_GSTIN", "IN_IFSC",
+    "EMAIL", "PHONE", "IN_AADHAAR", "IN_AADHAAR_UNVERIFIED", "IN_PAN", "IN_GSTIN", "IN_IFSC",
     "IN_PASSPORT", "US_SSN", "US_ITIN", "US_ZIP", "US_ROUTING", "US_DL",
     "CREDIT_CARD", "IBAN", "IP_ADDRESS", "URL",
 ]
@@ -482,7 +482,7 @@ def pii_detect_and_mask(text, include_india, include_us, include_ner, disabled_t
     try:
         disabled = list(disabled_types or [])
         if not include_india:
-            disabled.extend(["IN_AADHAAR", "IN_PAN", "IN_GSTIN", "IN_IFSC", "IN_PASSPORT", "IN_PHONE"])
+            disabled.extend(["IN_AADHAAR", "IN_AADHAAR_UNVERIFIED", "IN_PAN", "IN_GSTIN", "IN_IFSC", "IN_PASSPORT", "IN_PHONE"])
         if not include_us:
             disabled.extend(["US_SSN", "US_ITIN", "US_PHONE", "US_ZIP", "US_ROUTING", "US_DL"])
         config.config.PII_NER_ENABLED = bool(include_ner)

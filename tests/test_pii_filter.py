@@ -86,6 +86,34 @@ def test_checksum_validators(pii):
     assert "IN_AADHAAR" in _entities(pii, f"id {VALID_AADHAAR_SPACED} ok")
 
 
+def test_aadhaar_checksum_failure_context_fallback(pii):
+    from core.pii_patterns import verhoeff_valid
+
+    # a 12-digit number that fails the Verhoeff checksum is invisible without
+    # context, but must be caught (as unverified) next to an Aadhaar keyword
+    digits = VALID_AADHAAR_COMPACT[:-1] + "9"
+    assert digits != VALID_AADHAAR_COMPACT
+    assert not verhoeff_valid(digits)
+    assert "IN_AADHAAR" not in _entities(pii, f"ref {digits} ok")
+    entities = _entities(pii, f"my aadhar number is {digits}")
+    assert "IN_AADHAAR_UNVERIFIED" in entities
+
+    # a checksum-valid Aadhaar next to the same keywords keeps the verified id
+    for word in ("aadhaar", "aadhar", "uid", "uidai"):
+        found = _entities(pii, f"{word} {VALID_AADHAAR_COMPACT}")
+        assert "IN_AADHAAR" in found, word
+        assert "IN_AADHAAR_UNVERIFIED" not in found, word
+
+
+def test_aadhaar_unverified_masked_for_agent(pii):
+    digits = VALID_AADHAAR_COMPACT[:-1] + "9"
+    masked = pii.mask_for_agent(f"aadhar {digits}", namespace="t:unv")
+    assert digits not in masked.masked_text
+    assert "[AADHAAR_1]" in masked.masked_text
+    restored = pii.restore_for_user(masked.masked_text, namespace="t:unv")
+    assert digits in restored
+
+
 def test_weak_patterns_need_context(pii):
     # bare 5-digit number is NOT a ZIP without zip/postal context
     assert "US_ZIP" not in _entities(pii, "order 94105 shipped")

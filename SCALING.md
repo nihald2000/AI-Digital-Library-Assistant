@@ -172,6 +172,11 @@ Notes:
   optional NER (`presidio-analyzer`, `PII_NER_ENABLED`).
 - Custom rules: users add keywords or regexes (persisted in the `meta` table) that get masked everywhere;
   the PII tab can disable any detector type per scan.
+- Aadhaar nuance: the Verhoeff checksum decides the entity. Valid numbers are `IN_AADHAAR`; a 12-digit
+  number that fails checksums but sits next to an Aadhaar keyword is still masked as `IN_AADHAAR_UNVERIFIED`
+  (typo safety net — the raw digits must never reach the agent). A random 12-digit number with no Aadhaar
+  context stays undetected to avoid false positives; checksum-validated matches always outrank the fallback.
+  Detection remains best effort - no completeness or compliance claim is made.
 - **We make no claim of completeness or regulatory compliance** — detection is best-effort; validate before
   regulated use. The voice/LlamaIndex agentic path is not masked today (see `mcp_tools/voice_tool.py`).
 
