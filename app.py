@@ -8,10 +8,15 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-import nest_asyncio
+from core.asyncio_compat import apply as apply_asyncio_compat
+from core.asyncio_compat import ensure_utf8_stdio
 
-# Apply nest_asyncio to handle nested event loops in Gradio
-nest_asyncio.apply()
+# Patched asyncio: nested loops for Gradio callbacks AND tolerance for the
+# `loop_factory` kwarg that modern uvicorn passes to asyncio.run (uvicorn>=0.35
+# + unpatched nest_asyncio crashes the server thread -> "cannot find empty
+# port" on single-port hosts like HF Spaces).
+apply_asyncio_compat()
+ensure_utf8_stdio()
 
 # Import our custom modules
 from services.bootstrap import get_services
