@@ -112,44 +112,58 @@ class LlamaIndexService:
             logger.error(f"Error during LlamaIndex async initialization: {str(e)}")
 
     async def sync_from_document_store(self):
-        """Sync documents from DocumentStore to LlamaIndex"""
+        """Sync documents from DocumentStore to LlamaIndex (bounded).
+
+        Agentic RAG builds a *second* full in-RAM index, so at 1M+ documents
+        this must stay capped (LLAMAINDEX_MAX_DOCS) and stream rather than
+        materialize the whole library.
+        """
         try:
-            logger.info("Syncing documents from DocumentStore to LlamaIndex...")
-            
-            # Fetch documents from async document store
-            # Limit to 1000 for now to avoid memory issues
-            docs = await self.document_store.list_documents(limit=1000)
-            
-            if not docs:
+            if not self.config.LLAMAINDEX_ENABLED:
+                logger.info("LlamaIndex disabled (LLAMAINDEX_ENABLED=false) - skipping sync")
+                return
+            try:
+                total_docs = await self.document_store.count_documents()
+            except Exception:
+                total_docs = -1
+            if 0 <= total_docs > self.config.LLAMAINDEX_MAX_DOCS:
+                logger.warning(
+                    "Agentic index cap hit: %s documents > LLAMAINDEX_MAX_DOCS (%s). "
+                    "Agentic features disabled for scale; use semantic_search instead.",
+                    total_docs, self.config.LLAMAINDEX_MAX_DOCS,
+                )
+                return
+
+            logger.info("Syncing documents from DocumentStore to LlamaIndex (capped at %s)...",
+                        self.config.LLAMAINDEX_MAX_DOCS)
+            llama_docs = []
+            count = 0
+            async for doc in self.document_store.iter_documents(batch_size=500):
+                count += 1
+                if count > self.config.LLAMAINDEX_MAX_DOCS:
+                    break
+                llama_docs.append(Document(
+                    text=doc.content,
+                    metadata={
+                        "filename": doc.filename,
+                        "document_id": doc.id,
+                        **doc.metadata
+                    }
+                ))
+            if not llama_docs:
                 logger.warning("No documents found in DocumentStore to sync.")
-                # Create empty index if no docs
                 self.index = VectorStoreIndex.from_documents([])
             else:
-                # Convert to LlamaIndex documents
-                llama_docs = []
-                for doc in docs:
-                    llama_doc = Document(
-                        text=doc.content,
-                        metadata={
-                            "filename": doc.filename,
-                            "document_id": doc.id,
-                            **doc.metadata
-                        }
-                    )
-                    llama_docs.append(llama_doc)
-                
-                logger.info(f"Building LlamaIndex with {len(llama_docs)} documents...")
+                logger.info("Building LlamaIndex with %s documents...", len(llama_docs))
                 self.index = VectorStoreIndex.from_documents(llama_docs)
-            
+
             # Persist storage
-            if not self.storage_dir.exists():
-                self.storage_dir.mkdir(parents=True, exist_ok=True)
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
             self.index.storage_context.persist(persist_dir=str(self.storage_dir))
-            
+
             # Re-initialize agent with new index
             self._initialize_agent()
             logger.info("LlamaIndex sync complete.")
-            
         except Exception as e:
             logger.error(f"Error syncing LlamaIndex: {str(e)}")
 

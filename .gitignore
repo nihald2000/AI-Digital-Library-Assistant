@@ -26,6 +26,7 @@ Thumbs.db
 # Ignore database or app data
 db/
 *.sqlite3
+data/
 
 # Ignore Gradio temp files
 gradio_cached_examples/

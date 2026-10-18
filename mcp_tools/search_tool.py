@@ -1,437 +1,387 @@
-import logging
-from typing import List, Dict, Any, Optional
-import asyncio
+"""Search tool upgraded for the 1M+ scale retrieval path.
 
-from core.models import SearchResult
-from services.vector_store_service import VectorStoreService
+Pipeline per query:
+  1. embed the query (LRU-cached on the embedding service)
+  2. dense leg: FAISS search with overfetch escalation
+  3. sparse leg: BM25 over SQLite chunks (bm25s), skipped when unavailable
+  4. Reciprocal Rank Fusion of the two ranked lists
+  5. hydrate fused candidates in one batched SQL round trip
+  6. optional cross-encoder rerank of the top N candidates
+  7. document-level metadata enrichment (batched, not the legacy N+1)
+
+The public signatures are unchanged:
+  search(query, top_k, filters, similarity_threshold)
+  agentic_search, multi_query_search, search_by_document, search_by_category,
+  search_with_date_range, get_search_suggestions, explain_search
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from core.models import SearchResult, Document
 from services.embedding_service import EmbeddingService
 from services.document_store_service import DocumentStoreService
 import config
 
 logger = logging.getLogger(__name__)
 
+
 class SearchTool:
-    def __init__(self, vector_store: VectorStoreService, embedding_service: EmbeddingService,
-                 document_store: Optional[DocumentStoreService] = None, llamaindex_service: Any = None):
+    def __init__(
+        self,
+        vector_store: Any,
+        embedding_service: EmbeddingService,
+        document_store: Optional[DocumentStoreService] = None,
+        llamaindex_service: Any = None,
+        hybrid_service: Any = None,
+    ):
         self.vector_store = vector_store
         self.embedding_service = embedding_service
         self.document_store = document_store
         self.llamaindex_service = llamaindex_service
+        self.hybrid_service = hybrid_service
         self.config = config.config
-    
-    async def search(self, query: str, top_k: int = 5, filters: Optional[Dict[str, Any]] = None,
-                    similarity_threshold: Optional[float] = None) -> List[SearchResult]:
-        """Perform semantic search"""
+
+    # ------------------------------------------------------------------ query
+    async def search(
+        self, query: str, top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> List[SearchResult]:
+        """Hybrid (dense + sparse) search with RRF fusion."""
+        started = time.perf_counter()
         try:
-            if not query.strip():
+            if not query or not query.strip():
                 logger.warning("Empty search query provided")
                 return []
-            
-            # Use default threshold if not provided
-            if similarity_threshold is None:
-                similarity_threshold = self.config.SIMILARITY_THRESHOLD
-            
-            logger.info(f"Performing semantic search for: '{query}' (top_k={top_k})")
-            
-            # Generate query embedding
-            query_embedding = await self.embedding_service.generate_single_embedding(query)
-            
-            if not query_embedding:
-                logger.error("Failed to generate query embedding")
-                return []
-            
-            # Perform vector search
-            results = await self.vector_store.search(
-                query_embedding=query_embedding,
-                top_k=top_k,
-                filters=filters
+            top_k = max(1, int(top_k))
+            threshold = (
+                similarity_threshold
+                if similarity_threshold is not None
+                else self.config.SIMILARITY_THRESHOLD
             )
-            
-            # Filter by similarity threshold
-            filtered_results = [
-                result for result in results 
-                if result.score >= similarity_threshold
-            ]
-            
-            logger.info(f"Found {len(filtered_results)} results above threshold {similarity_threshold}")
-            
-            # Enhance results with additional metadata if document store is available
-            if self.document_store:
-                enhanced_results = await self._enhance_results_with_metadata(filtered_results)
-                return enhanced_results
-            
-            return filtered_results
-            
-        except Exception as e:
-            logger.error(f"Error performing semantic search: {str(e)}")
+            logger.info("Hybrid search: '%s' (top_k=%s)", query, top_k)
+
+            fused = await self._hybrid_fuse(query, top_k, filters)
+            if not fused:
+                logger.info("No candidates from either leg")
+                return []
+
+            hydrated = await self.hybrid_service.hydrate_candidates(fused)
+
+            # optional cross-encoder rerank
+            if self.hybrid_service and len(hydrated) > 1:
+                try:
+                    content_lookup = {entry.vector_id: row["content"] for entry, row in hydrated}
+                    row_by_id = {entry.vector_id: row for entry, row in hydrated}
+                    reranked = await self.hybrid_service.reranker.rerank(
+                        query, [entry for entry, _ in hydrated], content_lookup
+                    )
+                    hydrated = [
+                        (entry, row_by_id[entry.vector_id])
+                        for entry in reranked if entry.vector_id in row_by_id
+                    ]
+                except Exception as exc:
+                    logger.warning("Rerank skipped: %s", exc)
+
+            results: List[SearchResult] = []
+            for entry, chunk in hydrated:
+                # fused scores are rank-based, so the legacy similarity
+                # threshold applies to the dense score when that leg fired.
+                dense_floor = self.config.SIMILARITY_THRESHOLD if similarity_threshold is None else similarity_threshold
+                dense_floor = min(dense_floor, 0.95) if dense_floor > 0 else dense_floor
+                if entry.dense_score is not None and entry.dense_score < max(0.05, dense_floor):
+                    continue
+                results.append(SearchResult(
+                    chunk_id=chunk["chunk_id"],
+                    document_id=chunk["document_id"],
+                    content=chunk["content"],
+                    score=entry.fused_score,
+                    metadata={
+                        **(chunk.get("metadata") or {}),
+                        "_dense_score": entry.dense_score,
+                        "_sparse_score": entry.sparse_score,
+                        "_dense_rank": entry.dense_rank,
+                        "_sparse_rank": entry.sparse_rank,
+                    },
+                ))
+            results = results[:top_k]
+
+            # document metadata enrichment (one batched call, not N+1)
+            if self.document_store and results:
+                doc_ids = [r.document_id for r in results]
+                metas = await self.document_store.get_documents_metadata_batch(doc_ids)
+                for result in results:
+                    meta = metas.get(result.document_id)
+                    if meta:
+                        result.metadata.update({
+                            "document_filename": meta.get("filename"),
+                            "document_type": meta.get("doc_type"),
+                            "document_tags": meta.get("tags"),
+                            "document_category": meta.get("category"),
+                            "document_created_at": meta.get("created_at"),
+                            "document_summary": meta.get("summary"),
+                        })
+
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.info(
+                "Hybrid search returned %s results in %.0fms",
+                len(results), elapsed_ms,
+            )
+            return results
+        except Exception as exc:
+            logger.exception("Hybrid search failed: %s", exc)
             return []
 
+    async def _hybrid_fuse(
+        self, query: str, top_k: int,
+        filters: Optional[Dict[str, Any]],
+    ) -> List[Any]:
+        """Returns a list of FusionResult entries (dense-only or RRF-fused)."""
+        from services.hybrid_search_service import FusionResult
+
+        # Dense leg always runs.
+        query_embedding = await self.embedding_service.generate_single_embedding(query)
+        if query_embedding is None:
+            return []
+        dense_rows = await self.vector_store.search(
+            query_embedding=query_embedding, top_k=top_k,
+            filters=filters,
+        )
+        dense: List[Tuple[int, float]] = []
+        for row in dense_rows:
+            vid = (row.metadata or {}).get("_vector_id")
+            if vid is not None:
+                dense.append((int(vid), row.score))
+
+        # Sparse leg when available
+        sparse: List[Tuple[int, float]] = []
+        if (
+            self.hybrid_service
+            and self.hybrid_service.bm25.exists_index()
+        ):
+            try:
+                sparse = await self.hybrid_service.bm25.query(query, max(top_k * 3, 15))
+            except Exception as exc:
+                logger.warning("Sparse leg failed (%s) - dense only", exc)
+
+        if not dense and not sparse:
+            return []
+        if not sparse:
+            # Dense-only path routes through the same FusionResult structure
+            # so hydrate/rerank/threshold logic stays uniform.
+            return [
+                FusionResult(vector_id=vid, fused_score=score, dense_score=score)
+                for vid, score in dense
+            ]
+
+        return await self.hybrid_service.fuse(dense, sparse)
+
+    # ------------------------------------------------------------- utilities
     async def agentic_search(self, query: str) -> str:
-        """Perform agentic search using LlamaIndex"""
+        """Agentic search using the LlamaIndex ReAct agent."""
         if not self.llamaindex_service:
             logger.warning("LlamaIndex service not available for agentic search")
             return "Agentic search not available."
-        
         try:
-            logger.info(f"Performing agentic search for: '{query}'")
+            logger.info("Agentic search: '%s'", query)
             return await self.llamaindex_service.query(query)
-        except Exception as e:
-            logger.error(f"Error performing agentic search: {str(e)}")
-            return f"Error performing agentic search: {str(e)}"
-    
-    async def _enhance_results_with_metadata(self, results: List[SearchResult]) -> List[SearchResult]:
-        """Enhance search results with document metadata"""
+        except Exception as exc:
+            logger.error("Error performing agentic search: %s", exc)
+            return f"Error performing agentic search: {str(exc)}"
+
+    async def multi_query_search(
+        self, queries: List[str], top_k: int = 5,
+        aggregate_method: str = "rrf",
+    ) -> List[SearchResult]:
+        """Run the fused query set in parallel and merge by score."""
         try:
-            enhanced_results = []
-            
-            for result in results:
-                try:
-                    # Get document metadata
-                    document = await self.document_store.get_document(result.document_id)
-                    
-                    if document:
-                        # Add document metadata to result
-                        enhanced_metadata = {
-                            **result.metadata,
-                            "document_filename": document.filename,
-                            "document_type": document.doc_type.value,
-                            "document_tags": document.tags,
-                            "document_category": document.category,
-                            "document_created_at": document.created_at.isoformat(),
-                            "document_summary": document.summary
-                        }
-                        
-                        enhanced_result = SearchResult(
-                            chunk_id=result.chunk_id,
-                            document_id=result.document_id,
-                            content=result.content,
-                            score=result.score,
-                            metadata=enhanced_metadata
-                        )
-                        
-                        enhanced_results.append(enhanced_result)
-                    else:
-                        # Document not found, use original result
-                        enhanced_results.append(result)
-                        
-                except Exception as e:
-                    logger.warning(f"Error enhancing result {result.chunk_id}: {str(e)}")
-                    enhanced_results.append(result)
-            
-            return enhanced_results
-            
-        except Exception as e:
-            logger.error(f"Error enhancing results: {str(e)}")
-            return results
-    
-    async def multi_query_search(self, queries: List[str], top_k: int = 5, 
-                               aggregate_method: str = "merge") -> List[SearchResult]:
-        """Perform search with multiple queries and aggregate results"""
-        try:
-            all_results = []
-            
-            # Perform search for each query
-            for query in queries:
-                if query.strip():
-                    query_results = await self.search(query, top_k)
-                    all_results.extend(query_results)
-            
-            if not all_results:
+            valid = [q for q in queries if q and q.strip()]
+            if not valid:
                 return []
-            
-            # Aggregate results
-            if aggregate_method == "merge":
-                return await self._merge_results(all_results, top_k)
-            elif aggregate_method == "intersect":
-                return await self._intersect_results(all_results, top_k)
-            elif aggregate_method == "average":
-                return await self._average_results(all_results, top_k)
-            else:
-                # Default to merge
-                return await self._merge_results(all_results, top_k)
-                
-        except Exception as e:
-            logger.error(f"Error in multi-query search: {str(e)}")
-            return []
-    
-    async def _merge_results(self, results: List[SearchResult], top_k: int) -> List[SearchResult]:
-        """Merge results and remove duplicates, keeping highest scores"""
-        try:
-            # Group by chunk_id and keep highest score
-            chunk_scores = {}
-            chunk_results = {}
-            
-            for result in results:
-                chunk_id = result.chunk_id
-                if chunk_id not in chunk_scores or result.score > chunk_scores[chunk_id]:
-                    chunk_scores[chunk_id] = result.score
-                    chunk_results[chunk_id] = result
-            
-            # Sort by score and return top_k
-            merged_results = list(chunk_results.values())
-            merged_results.sort(key=lambda x: x.score, reverse=True)
-            
-            return merged_results[:top_k]
-            
-        except Exception as e:
-            logger.error(f"Error merging results: {str(e)}")
-            return results[:top_k]
-    
-    async def _intersect_results(self, results: List[SearchResult], top_k: int) -> List[SearchResult]:
-        """Find chunks that appear in multiple queries"""
-        try:
-            # Count occurrences of each chunk
-            chunk_counts = {}
-            chunk_results = {}
-            
-            for result in results:
-                chunk_id = result.chunk_id
-                chunk_counts[chunk_id] = chunk_counts.get(chunk_id, 0) + 1
-                
-                if chunk_id not in chunk_results or result.score > chunk_results[chunk_id].score:
-                    chunk_results[chunk_id] = result
-            
-            # Filter chunks that appear more than once
-            intersect_results = [
-                result for chunk_id, result in chunk_results.items()
-                if chunk_counts[chunk_id] > 1
-            ]
-            
-            # Sort by score
-            intersect_results.sort(key=lambda x: x.score, reverse=True)
-            
-            return intersect_results[:top_k]
-            
-        except Exception as e:
-            logger.error(f"Error intersecting results: {str(e)}")
-            return []
-    
-    async def _average_results(self, results: List[SearchResult], top_k: int) -> List[SearchResult]:
-        """Average scores for chunks that appear multiple times"""
-        try:
-            # Group by chunk_id and calculate average scores
-            chunk_groups = {}
-            
-            for result in results:
-                chunk_id = result.chunk_id
-                if chunk_id not in chunk_groups:
-                    chunk_groups[chunk_id] = []
-                chunk_groups[chunk_id].append(result)
-            
-            # Calculate average scores
-            averaged_results = []
-            for chunk_id, group in chunk_groups.items():
-                avg_score = sum(r.score for r in group) / len(group)
-                
-                # Use the result with the highest individual score but update the score to average
-                best_result = max(group, key=lambda x: x.score)
-                averaged_result = SearchResult(
-                    chunk_id=best_result.chunk_id,
-                    document_id=best_result.document_id,
-                    content=best_result.content,
-                    score=avg_score,
-                    metadata={
-                        **best_result.metadata,
-                        "query_count": len(group),
-                        "score_range": f"{min(r.score for r in group):.3f}-{max(r.score for r in group):.3f}"
-                    }
+            # each individual call already runs the hybrid pipeline; running
+            # them concurrently keeps wall time close to a single search
+            nested = await asyncio.gather(*(self.search(q, top_k) for q in valid))
+            flat_results: List[SearchResult] = [r for batch in nested for r in batch]
+            if not flat_results:
+                return []
+            if aggregate_method == "rrf":
+                return self._dedup_keep_max(flat_results, top_k)
+            if aggregate_method == "intersect":
+                counts: Dict[str, int] = {}
+                for r in flat_results:
+                    counts[r.chunk_id] = counts.get(r.chunk_id, 0) + 1
+                keep = {cid for cid, c in counts.items() if c > 1}
+                return self._dedup_keep_max(
+                    [r for r in flat_results if r.chunk_id in keep], top_k
                 )
-                averaged_results.append(averaged_result)
-            
-            # Sort by average score
-            averaged_results.sort(key=lambda x: x.score, reverse=True)
-            
-            return averaged_results[:top_k]
-            
-        except Exception as e:
-            logger.error(f"Error averaging results: {str(e)}")
-            return results[:top_k]
-    
+            if aggregate_method == "average":
+                grouped: Dict[str, List[SearchResult]] = {}
+                for r in flat_results:
+                    grouped.setdefault(r.chunk_id, []).append(r)
+                averages = [
+                    SearchResult(
+                        chunk_id=cid,
+                        document_id=group[0].document_id,
+                        content=group[0].content,
+                        score=sum(g.score for g in group) / len(group),
+                        metadata=group[0].metadata,
+                    )
+                    for cid, group in grouped.items()
+                ]
+                return sorted(averages, key=lambda r: r.score, reverse=True)[:top_k]
+            return self._dedup_keep_max(flat_results, top_k)
+        except Exception as exc:
+            logger.error("Multi-query search failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _dedup_keep_max(results: List[SearchResult], top_k: int) -> List[SearchResult]:
+        best: Dict[str, SearchResult] = {}
+        for result in results:
+            current = best.get(result.chunk_id)
+            if current is None or result.score > current.score:
+                best[result.chunk_id] = result
+        out = sorted(best.values(), key=lambda r: r.score, reverse=True)
+        return out[:top_k]
+
     async def search_by_document(self, document_id: str, query: str, top_k: int = 5) -> List[SearchResult]:
-        """Search within a specific document"""
-        try:
-            filters = {"document_id": document_id}
-            return await self.search(query, top_k, filters)
-            
-        except Exception as e:
-            logger.error(f"Error searching within document {document_id}: {str(e)}")
-            return []
-    
+        return await self.search(query, top_k, filters={"document_id": document_id})
+
     async def search_by_category(self, category: str, query: str, top_k: int = 5) -> List[SearchResult]:
-        """Search within documents of a specific category"""
-        try:
-            if not self.document_store:
-                logger.warning("Document store not available for category search")
-                return await self.search(query, top_k)
-            
-            # Get documents in the category
-            documents = await self.document_store.list_documents(
-                limit=1000,  # Adjust as needed
-                filters={"category": category}
-            )
-            
-            if not documents:
-                logger.info(f"No documents found in category '{category}'")
-                return []
-            
-            # Extract document IDs
-            document_ids = [doc.id for doc in documents]
-            
-            # Search with document ID filter
-            filters = {"document_ids": document_ids}
-            return await self.search(query, top_k, filters)
-            
-        except Exception as e:
-            logger.error(f"Error searching by category {category}: {str(e)}")
+        if not self.document_store:
+            return await self.search(query, top_k)
+        docs = await self.document_store.search_documents(
+            category, fields=["category"], limit=self.config.SEARCH_MAX_OVERFETCH
+        )
+        if not docs:
+            logger.info("No documents found in category '%s'", category)
             return []
-    
-    async def search_with_date_range(self, query: str, start_date, end_date, top_k: int = 5) -> List[SearchResult]:
-        """Search documents within a date range"""
-        try:
-            if not self.document_store:
-                logger.warning("Document store not available for date range search")
-                return await self.search(query, top_k)
-            
-            # Get documents in the date range
-            documents = await self.document_store.list_documents(
-                limit=1000,  # Adjust as needed
-                filters={
-                    "created_after": start_date,
-                    "created_before": end_date
-                }
+        doc_ids = [doc.id for doc in docs]
+        return await self.search(query, top_k, filters={"document_ids": doc_ids})
+
+    async def search_with_date_range(
+        self, query: str, start_date, end_date, top_k: int = 5
+    ) -> List[SearchResult]:
+        if not self.document_store:
+            return await self.search(query, top_k)
+        # pushed down to the SQLite index on created_at - no full scans
+        all_matched: List[Document] = []
+        page, offset = 1000, 0
+        filters = {"created_after": start_date, "created_before": end_date}
+        while True:
+            page_docs = await self.document_store.list_documents(
+                limit=page, offset=offset, filters=filters
             )
-            
-            if not documents:
-                logger.info(f"No documents found in date range")
-                return []
-            
-            # Extract document IDs
-            document_ids = [doc.id for doc in documents]
-            
-            # Search with document ID filter
-            filters = {"document_ids": document_ids}
-            return await self.search(query, top_k, filters)
-            
-        except Exception as e:
-            logger.error(f"Error searching with date range: {str(e)}")
+            if not page_docs:
+                break
+            all_matched.extend(page_docs)
+            offset += page
+            if len(all_matched) >= self.config.SEARCH_MAX_OVERFETCH:
+                all_matched = all_matched[: self.config.SEARCH_MAX_OVERFETCH]
+                break
+        if not all_matched:
+            logger.info("No documents found in date range")
             return []
-    
+        return await self.search(query, top_k, filters={"document_ids": [d.id for d in all_matched]})
+
     async def get_search_suggestions(self, partial_query: str, limit: int = 5) -> List[str]:
-        """Get search suggestions based on partial query"""
         try:
-            # This is a simple implementation
-            # In a production system, you might want to use a more sophisticated approach
-            
             if len(partial_query) < 2:
                 return []
-            
-            # Search for the partial query
-            results = await self.search(partial_query, top_k=20)
-            
-            # Extract potential query expansions from content
+            sparse_leg = (
+                getattr(self.hybrid_service.bm25, "enabled", False)
+                if self.hybrid_service else False
+            )
+            if self.hybrid_service and sparse_leg and self.hybrid_service.bm25.exists_index():
+                # Lexical suggestions scale better than a brute-force content scan
+                rows = await self.hybrid_service.bm25.query(partial_query, top_k=20, excluded=None)
+                if not rows:
+                    return []
+                vid_list = [vid for vid, _ in rows]
+                chunks_raw = await self.vector_store.store.fetch_all(
+                    "SELECT content FROM chunks WHERE vector_id IN (%s)"
+                    % ",".join("?" for _ in vid_list),
+                    vid_list,
+                )
+                contents = [r["content"] for r in chunks_raw]
+            else:
+                results = await self.search(partial_query, top_k=20)
+                contents = [r.content for r in results]
             suggestions = set()
-            
-            for result in results:
-                content_words = result.content.lower().split()
-                for i, word in enumerate(content_words):
+            for content in contents:
+                words = content.lower().split()
+                for i, word in enumerate(words):
                     if partial_query.lower() in word:
-                        # Add the word itself
                         suggestions.add(word.strip('.,!?;:'))
-                        
-                        # Add phrases that include this word
                         if i > 0:
-                            phrase = f"{content_words[i-1]} {word}".strip('.,!?;:')
-                            suggestions.add(phrase)
-                        if i < len(content_words) - 1:
-                            phrase = f"{word} {content_words[i+1]}".strip('.,!?;:')
-                            suggestions.add(phrase)
-            
-            # Filter and sort suggestions
-            filtered_suggestions = [
-                s for s in suggestions 
+                            suggestions.add(f"{words[i-1]} {word}".strip('.,!?;:'))
+                        if i < len(words) - 1:
+                            suggestions.add(f"{word} {words[i+1]}".strip('.,!?;:'))
+            filtered = [
+                s for s in suggestions
                 if len(s) > len(partial_query) and s.startswith(partial_query.lower())
             ]
-            
-            return sorted(filtered_suggestions)[:limit]
-            
-        except Exception as e:
-            logger.error(f"Error getting search suggestions: {str(e)}")
+            return sorted(filtered)[:limit]
+        except Exception as exc:
+            logger.error("Error getting search suggestions: %s", exc)
             return []
-    
+
     async def explain_search(self, query: str, top_k: int = 3) -> Dict[str, Any]:
-        """Provide detailed explanation of search process and results"""
         try:
-            explanation = {
+            explanation: Dict[str, Any] = {
                 "query": query,
                 "steps": [],
                 "results_analysis": {},
-                "performance_metrics": {}
+                "performance_metrics": {},
             }
-            
-            # Step 1: Query processing
-            explanation["steps"].append({
-                "step": "query_processing",
-                "description": "Processing and normalizing the search query",
-                "details": {
-                    "original_query": query,
-                    "cleaned_query": query.strip(),
-                    "query_length": len(query)
-                }
-            })
-            
-            # Step 2: Embedding generation
-            import time
-            start_time = time.time()
-            
+            started = time.perf_counter()
+
+            embed_start = time.perf_counter()
             query_embedding = await self.embedding_service.generate_single_embedding(query)
-            
-            embedding_time = time.time() - start_time
-            
-            explanation["steps"].append({
+            explain_step = {
                 "step": "embedding_generation",
-                "description": "Converting query to vector embedding",
+                "description": "Converting the query into a dense vector",
                 "details": {
                     "embedding_dimension": len(query_embedding) if query_embedding else 0,
-                    "generation_time_ms": round(embedding_time * 1000, 2)
-                }
-            })
-            
-            # Step 3: Vector search
-            start_time = time.time()
-            
-            results = await self.vector_store.search(query_embedding, top_k)
-            
-            search_time = time.time() - start_time
-            
+                    "generation_time_ms": round((time.perf_counter() - embed_start) * 1000, 2),
+                },
+            }
+            explanation["steps"].append(explain_step)
+
+            search_start = time.perf_counter()
+            results = await self.search(query, top_k=top_k)
+            search_ms = round((time.perf_counter() - search_start) * 1000, 2)
+
             explanation["steps"].append({
-                "step": "vector_search",
-                "description": "Searching vector database for similar content",
+                "step": "hybrid_retrieval",
+                "description": "Dense (FAISS) + sparse (BM25) fusion with RRF",
                 "details": {
-                    "search_time_ms": round(search_time * 1000, 2),
+                    "elapsed_ms": search_ms,
                     "results_found": len(results),
-                    "top_score": results[0].score if results else 0,
-                    "score_range": f"{min(r.score for r in results):.3f}-{max(r.score for r in results):.3f}" if results else "N/A"
-                }
+                    "hybrid_stats": (
+                        self.hybrid_service.stats() if self.hybrid_service else {}
+                    ),
+                },
             })
-            
-            # Results analysis
+
             if results:
                 explanation["results_analysis"] = {
                     "total_results": len(results),
                     "average_score": sum(r.score for r in results) / len(results),
-                    "unique_documents": len(set(r.document_id for r in results)),
-                    "content_lengths": [len(r.content) for r in results]
+                    "unique_documents": len({r.document_id for r in results}),
+                    "content_lengths": [len(r.content) for r in results],
                 }
-            
-            # Performance metrics
+
             explanation["performance_metrics"] = {
-                "total_time_ms": round((embedding_time + search_time) * 1000, 2),
-                "embedding_time_ms": round(embedding_time * 1000, 2),
-                "search_time_ms": round(search_time * 1000, 2)
+                "total_time_ms": round((time.perf_counter() - started) * 1000, 2),
+                "embedding_time_ms": explain_step["details"]["generation_time_ms"],
+                "retrieval_time_ms": search_ms,
             }
-            
             return explanation
-            
-        except Exception as e:
-            logger.error(f"Error explaining search: {str(e)}")
-            return {"error": str(e)}
+        except Exception as exc:
+            logger.error("Error explaining search: %s", exc)
+            return {"error": str(exc)}

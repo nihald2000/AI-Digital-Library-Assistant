@@ -1,67 +1,29 @@
+"""FastMCP server for the AI Digital Library Assistant.
+
+Wired through services.bootstrap so the same storage core + hybrid search
+pipeline backs both the Gradio app and this MCP entry point.
+"""
 import asyncio
 import logging
+import uuid
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from services.vector_store_service import VectorStoreService
-from services.document_store_service import DocumentStoreService
-from services.embedding_service import EmbeddingService
-from services.llm_service import LLMService
-from services.ocr_service import OCRService
-
-from mcp_tools.ingestion_tool import IngestionTool
-from mcp_tools.search_tool import SearchTool
-from mcp_tools.generative_tool import GenerativeTool
-
-# Phase 2 & 3: Voice and Podcast
-from services.llamaindex_service import LlamaIndexService
-from services.elevenlabs_service import ElevenLabsService
-from services.podcast_generator_service import PodcastGeneratorService
-from mcp_tools.voice_tool import VoiceTool
-from mcp_tools.podcast_tool import PodcastTool
+from services.bootstrap import AppServices
+import config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-logger.info("Initializing services for FastMCP...")
-vector_store_service = VectorStoreService()
-document_store_service = DocumentStoreService()
-embedding_service_instance = EmbeddingService()
-llm_service_instance = LLMService()
-ocr_service_instance = OCRService()
-
-ingestion_tool_instance = IngestionTool(
-    vector_store=vector_store_service,
-    document_store=document_store_service,
-    embedding_service=embedding_service_instance,
-    ocr_service=ocr_service_instance
-)
-search_tool_instance = SearchTool(
-    vector_store=vector_store_service,
-    embedding_service=embedding_service_instance,
-    document_store=document_store_service
-)
-generative_tool_instance = GenerativeTool(
-    llm_service=llm_service_instance,
-    search_tool=search_tool_instance
-)
-
-# Phase 2 & 3 Services
-logger.info("Initializing Phase 2 & 3 services...")
-llamaindex_service_instance = LlamaIndexService(document_store_service)
-elevenlabs_service_instance = ElevenLabsService(llamaindex_service_instance)
-podcast_generator_instance = PodcastGeneratorService(
-    llamaindex_service=llamaindex_service_instance,
-    llm_service=llm_service_instance
-)
-
-voice_tool_instance = VoiceTool(elevenlabs_service_instance)
-podcast_tool_instance = PodcastTool(podcast_generator_instance)
-
+logger.info("Initializing services for FastMCP (SQLite + hybrid retrieval)...")
+services = AppServices()
+vector_store_service = services.vector_store
+document_store_service = services.document_store
 mcp = FastMCP("")
 logger.info("FastMCP server initialized.")
+
 
 @mcp.tool()
 async def ingest_document(file_path: str, file_type: Optional[str] = None) -> Dict[str, Any]:
@@ -75,31 +37,203 @@ async def ingest_document(file_path: str, file_type: Optional[str] = None) -> Di
         if not actual_file_type:
             actual_file_type = Path(file_path).suffix.lower().strip('.')
             logger.info(f"Inferred file_type: {actual_file_type}")
-        result = await ingestion_tool_instance.process_document(file_path, actual_file_type)
+        result = await services.ingestion_tool.process_document(file_path, actual_file_type)
         logger.info(f"Ingestion result: {result}")
         return result
     except Exception as e:
         logger.error(f"Error in 'ingest_document' tool: {str(e)}", exc_info=True)
         return {"success": False, "error": str(e)}
 
+
+@mcp.tool()
+async def ingest_directory(directory_path: str, concurrency: int = 4) -> Dict[str, Any]:
+    """
+    Bulk ingest every supported file under a directory, synchronously.
+    For large bootstraps prefer ingest_directory_queue (worker queue).
+    """
+    logger.info(f"Tool 'ingest_directory' called with {directory_path}, concurrency={concurrency}")
+    try:
+        return await services.ingestion_tool.batch_process_directory(
+            directory_path, concurrency=concurrency
+        )
+    except Exception as e:
+        logger.error(f"Error in 'ingest_directory' tool: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def ingest_directory_queue(directory_path: str, concurrency: int = 4) -> Dict[str, Any]:
+    """
+    Enqueue a directory for background ingestion (persistent worker queue).
+    Returns a job_id; check progress with job_status or list_ingest_jobs.
+    Recommended for bootstrapping large libraries.
+    """
+    logger.info(f"Tool 'ingest_directory_queue' called with {directory_path}")
+    try:
+        from pathlib import Path as _Path
+        path = _Path(directory_path)
+        if not path.is_dir():
+            return {"success": False, "error": f"Not a directory: {directory_path}"}
+        return await services.ingest_queue.enqueue(
+            "directory", str(path), concurrency=concurrency
+        )
+    except Exception as e:
+        logger.error(f"Error in 'ingest_directory_queue' tool: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def ingest_queued(
+    target: str,
+    job_type: str = "document",
+    content: str = "",
+    filename: str = "queued_text.txt",
+    concurrency: int = 1,
+) -> Dict[str, Any]:
+    """
+    Queue a single ingestion job. job_type: document (target=file path),
+    directory, url, or text (pass the raw text via 'content').
+    """
+    try:
+        extra = None
+        if job_type == "text":
+            if not content:
+                return {"success": False, "error": "text jobs require 'content'"}
+            extra = {"content": content, "filename": filename}
+        return await services.ingest_queue.enqueue(
+            job_type, target, concurrency=concurrency, extra=extra,
+        )
+    except Exception as e:
+        logger.error(f"Error in 'ingest_queued' tool: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def job_status(job_id: str) -> Dict[str, Any]:
+    """Status of one background ingestion job (pending/running/done/failed)."""
+    try:
+        job = await services.ingest_queue.get_job(job_id)
+        return {"success": job is not None, "job": job}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def list_ingest_jobs(limit: int = 25) -> Dict[str, Any]:
+    """List recent background ingestion jobs with status and progress."""
+    try:
+        jobs = await services.ingest_queue.list_jobs(limit)
+        stats = await services.ingest_queue.get_stats()
+        return {"success": True, "jobs": jobs, "stats": stats}
+    except Exception as e:
+        return {"success": False, "error": str(e), "jobs": []}
+
+
+@mcp.tool()
+async def scan_pii(text: str) -> Dict[str, Any]:
+    """
+    Auto-detect sensitive data (India/US/global: Aadhaar, PAN, IFSC, GSTIN,
+    SSN, ITIN, phone, email, cards, IPs) and return the masked placeholder
+    view plus the findings table.
+    """
+    try:
+        result = services.pii_service.mask_for_agent(
+            text or "", namespace=f"mcp:{uuid.uuid4().hex}", register=False
+        )
+        return {
+            "success": True,
+            "masked_text": result.masked_text,
+            "masked_count": result.masked_count,
+            "findings": [
+                {
+                    "entity": f.entity, "label": f.label, "category": f.category,
+                    "placeholder": f.placeholder, "start": f.start, "end": f.end,
+                }
+                for f in result.findings
+            ],
+        }
+    except Exception as e:
+        logger.error(f"Error in 'scan_pii' tool: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def pii_add_custom_rule(
+    name: str, rule: str, rule_type: str = "keyword", tag: str = "KEYWORD"
+) -> Dict[str, Any]:
+    """
+    Add a custom PII filter rule that is applied in every masking pass.
+    rule_type: 'keyword' (exact term) or 'regex' (Python regex, case-insensitive).
+    """
+    try:
+        return await services.pii_service.add_custom_rule(name, rule, rule_type, tag)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def pii_remove_custom_rule(name: str) -> Dict[str, Any]:
+    """Remove a custom PII filter rule by its name."""
+    try:
+        return await services.pii_service.remove_custom_rule(name)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def pii_list_custom_rules() -> Dict[str, Any]:
+    """List the saved custom PII filter rules."""
+    try:
+        return {"success": True, "rules": services.pii_service.list_custom_rules()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def ingest_url(url: str) -> Dict[str, Any]:
+    """
+    Download a file over HTTP(S) and ingest it.
+    """
+    logger.info(f"Tool 'ingest_url' called with {url}")
+    try:
+        return await services.ingestion_tool.process_url(url)
+    except Exception as e:
+        logger.error(f"Error in 'ingest_url' tool: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def ingest_text(content: str, filename: str = "text_content.txt") -> Dict[str, Any]:
+    """
+    Ingest raw text content (e.g. pasted notes) directly.
+    """
+    logger.info(f"Tool 'ingest_text' called with filename: {filename}")
+    try:
+        return await services.ingestion_tool.process_text_content(content, filename)
+    except Exception as e:
+        logger.error(f"Error in 'ingest_text' tool: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
 @mcp.tool()
 async def semantic_search(query: str, top_k: int = 5, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Search through indexed content using natural language.
-    'filters' can be used to narrow down the search.
+    Hybrid search (dense FAISS + BM25 sparse, Reciprocal Rank Fusion) through
+    indexed content. 'filters' can narrow the search (document_id, doc_type).
     """
     logger.info(f"Tool 'semantic_search' called with query: {query}, top_k: {top_k}, filters: {filters}")
     try:
-        results = await search_tool_instance.search(query, top_k, filters)
+        results = await services.search_tool.search(query, top_k, filters)
         return {
             "success": True,
             "query": query,
             "results": [result.to_dict() for result in results],
-            "total_results": len(results)
+            "total_results": len(results),
         }
     except Exception as e:
         logger.error(f"Error in 'semantic_search' tool: {str(e)}", exc_info=True)
         return {"success": False, "error": str(e), "results": []}
+
 
 @mcp.tool()
 async def summarize_content(
@@ -118,14 +252,14 @@ async def summarize_content(
             doc = await document_store_service.get_document(document_id)
             if not doc:
                 return {"success": False, "error": f"Document {document_id} not found"}
-            text_to_summarize = doc.content
+            text_to_summarize = await document_store_service.load_content(document_id) or ""
         if not text_to_summarize:
             return {"success": False, "error": "No content provided for summarization"}
         max_length = 10000
         if len(text_to_summarize) > max_length:
             logger.warning(f"Content for summarization is long ({len(text_to_summarize)} chars), truncating to {max_length}")
             text_to_summarize = text_to_summarize[:max_length] + "..."
-        summary = await generative_tool_instance.summarize(text_to_summarize, style)
+        summary = await services.generative_tool.summarize(text_to_summarize, style)
         return {
             "success": True,
             "summary": summary,
@@ -136,6 +270,7 @@ async def summarize_content(
     except Exception as e:
         logger.error(f"Error in 'summarize_content' tool: {str(e)}", exc_info=True)
         return {"success": False, "error": str(e)}
+
 
 @mcp.tool()
 async def generate_tags(
@@ -151,13 +286,12 @@ async def generate_tags(
     try:
         text_for_tags = content
         if document_id and not text_for_tags:
-            doc = await document_store_service.get_document(document_id)
-            if not doc:
+            text_for_tags = await document_store_service.load_content(document_id) or ""
+            if not text_for_tags:
                 return {"success": False, "error": f"Document {document_id} not found"}
-            text_for_tags = doc.content
         if not text_for_tags:
             return {"success": False, "error": "No content provided for tag generation"}
-        tags = await generative_tool_instance.generate_tags(text_for_tags, max_tags)
+        tags = await services.generative_tool.generate_tags(text_for_tags, max_tags)
         if document_id and tags:
             await document_store_service.update_document_metadata(document_id, {"tags": tags})
             logger.info(f"Tags {tags} saved for document {document_id}")
@@ -171,15 +305,16 @@ async def generate_tags(
         logger.error(f"Error in 'generate_tags' tool: {str(e)}", exc_info=True)
         return {"success": False, "error": str(e)}
 
+
 @mcp.tool()
 async def answer_question(question: str, context_filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Answer questions using RAG (Retrieval Augmented Generation) over indexed content.
-    'context_filter' can be used to narrow down the context search.
+    Answer questions using hybrid RAG (Retrieval Augmented Generation) over
+    indexed content. 'context_filter' can narrow down the context search.
     """
     logger.info(f"Tool 'answer_question' called with question: {question}, context_filter: {context_filter}")
     try:
-        search_results = await search_tool_instance.search(question, top_k=5, filters=context_filter)
+        search_results = await services.search_tool.search(question, top_k=5, filters=context_filter)
         if not search_results:
             return {
                 "success": False,
@@ -187,7 +322,7 @@ async def answer_question(question: str, context_filter: Optional[Dict[str, Any]
                 "question": question,
                 "answer": "I could not find enough information in the documents to answer your question."
             }
-        answer = await generative_tool_instance.answer_question(question, search_results)
+        answer = await services.generative_tool.answer_question(question, search_results)
         return {
             "success": True,
             "question": question,
@@ -199,6 +334,7 @@ async def answer_question(question: str, context_filter: Optional[Dict[str, Any]
         logger.error(f"Error in 'answer_question' tool: {str(e)}", exc_info=True)
         return {"success": False, "error": str(e)}
 
+
 @mcp.tool()
 async def voice_qa(question: str, session_id: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -207,11 +343,12 @@ async def voice_qa(question: str, session_id: Optional[str] = None) -> Dict[str,
     """
     logger.info(f"Tool 'voice_qa' called with question: {question}")
     try:
-        result = await voice_tool_instance.voice_qa(question, session_id)
+        result = await services.voice_tool.voice_qa(question, session_id)
         return result
     except Exception as e:
         logger.error(f"Error in 'voice_qa' tool: {str(e)}", exc_info=True)
         return {"success": False, "error": str(e)}
+
 
 @mcp.tool()
 async def generate_podcast(
@@ -224,12 +361,11 @@ async def generate_podcast(
     """
     Generate a podcast from selected documents.
     Styles: conversational, educational, technical, casual.
-    Duration: 5-30 minutes recommended.
-    Voices: Rachel, Adam, Domi, Bella, Antoni, Josh, Sam, Emily, etc.
+    Recommend 5-15 minutes; voices: Rachel, Adam, Domi, Bella, ...
     """
     logger.info(f"Tool 'generate_podcast' called with {len(document_ids)} docs, style: {style}")
     try:
-        result = await podcast_tool_instance.generate_podcast(
+        result = await services.podcast_tool.generate_podcast(
             document_ids=document_ids,
             style=style,
             duration_minutes=duration_minutes,
@@ -241,24 +377,61 @@ async def generate_podcast(
         logger.error(f"Error in 'generate_podcast' tool: {str(e)}", exc_info=True)
         return {"success": False, "error": str(e)}
 
+
 @mcp.tool()
 async def list_documents_for_ui(limit: int = 100, offset: int = 0) -> Dict[str, Any]:
     """
-    (UI Helper) List documents from the document store.
-    Not a standard processing tool, but useful for UI population.
+    (UI Helper) Paginated document listing backed by SQLite indexes -
+    O(limit) at 1M+ documents instead of full filesystem scans.
     """
-    logger.info(f"Tool 'list_documents_for_ui' called with limit: {limit}, offset: {offset}")
+    logger.info(f"Tool 'list_documents_for_ui' called limit: {limit}, offset: {offset}")
     try:
         documents = await document_store_service.list_documents(limit, offset)
+        total = await document_store_service.count_documents()
         return {
             "success": True,
             "documents": [doc.to_dict() for doc in documents],
-            "total": len(documents)
+            "total": total,
         }
     except Exception as e:
         logger.error(f"Error in 'list_documents_for_ui' tool: {str(e)}", exc_info=True)
         return {"success": False, "error": str(e), "documents": []}
 
+
+@mcp.tool()
+async def library_stats() -> Dict[str, Any]:
+    """
+    Capacity/health view: FAISS vector stats, BM25 sparse index stats,
+    SQLite document counts, embedding model info.
+    """
+    try:
+        vector_stats = await vector_store_service.get_stats()
+        doc_stats = await document_store_service.get_stats()
+        bm25_stats = await services.bm25_service.get_stats()
+        embed_info = services.embedding_service.get_model_info()
+        return {
+            "success": True,
+            "vector": vector_stats,
+            "documents": doc_stats,
+            "bm25": bm25_stats,
+            "embedding": embed_info,
+            "hybrid": services.hybrid_search.stats(),
+        }
+    except Exception as e:
+        logger.error(f"Error in 'library_stats' tool: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+async def _startup() -> None:
+    """Boot the storage core + retrieval tiers before serving requests."""
+    await services.start()
+
+
 if __name__ == "__main__":
     logger.info("Starting FastMCP server...")
-    asyncio.run(mcp.run())
+    asyncio.run(_startup())
+    services.start_maintenance_in_thread()
+    try:
+        asyncio.run(mcp.run())
+    finally:
+        logger.info("FastMCP server loop exited.")

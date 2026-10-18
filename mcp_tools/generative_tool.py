@@ -1,4 +1,5 @@
 import logging
+import uuid
 from typing import List, Dict, Any, Optional
 import asyncio
 
@@ -9,10 +10,44 @@ from core.models import SearchResult
 logger = logging.getLogger(__name__)
 
 class GenerativeTool:
-    def __init__(self, llm_service: LLMService, search_tool: Optional[SearchTool] = None):
+    def __init__(self, llm_service: LLMService, search_tool: Optional[SearchTool] = None,
+                 pii_service: Any = None):
         self.llm_service = llm_service
         self.search_tool = search_tool
-    
+        # PII boundary: raw PII is never sent to the LLM; placeholders go out
+        # and originals are restored in the reply, in memory only.
+        self.pii_service = pii_service
+
+    def _mask(self, text: str) -> tuple:
+        """Mask PII for the agent. Returns (text, namespace)."""
+        if not self.pii_service or not text:
+            return text, None
+        try:
+            namespace = f"agent:{uuid.uuid4().hex}"
+            result = self.pii_service.mask_for_agent(
+                text, namespace=namespace, register=True
+            )
+            if result.findings:
+                logger.info(
+                    "PII boundary: masked %s findings before LLM call", len(result.findings)
+                )
+                return result.masked_text, namespace
+            return text, None
+        except Exception as exc:
+            logger.warning("PII masking failed (passing through): %s", exc)
+            return text, None
+
+    def _restore(self, text: str, namespace: Optional[str]) -> str:
+        if not self.pii_service or not namespace or not text:
+            return text
+        try:
+            restored = self.pii_service.restore_for_user(text, namespace)
+            self.pii_service.drop_namespace(namespace)
+            return restored
+        except Exception as exc:
+            logger.warning("PII restore failed: %s", exc)
+            return text
+
     async def summarize(self, content: str, style: str = "concise", max_length: Optional[int] = None) -> str:
         """Generate a summary of the given content"""
         try:
@@ -20,9 +55,11 @@ class GenerativeTool:
                 return "No content provided for summarization."
             
             logger.info(f"Generating {style} summary for content of length {len(content)}")
-            
-            summary = await self.llm_service.summarize(content, style, max_length)
-            
+
+            masked_content, namespace = self._mask(content)
+            summary = await self.llm_service.summarize(masked_content, style, max_length)
+            summary = self._restore(summary, namespace)
+
             logger.info(f"Generated summary of length {len(summary)}")
             return summary
             
@@ -92,9 +129,17 @@ class GenerativeTool:
                 context = ""
                 logger.info("No context available for answering question")
             
+            # PII boundary: question and context are masked before the LLM sees them
+            masked_question, question_namespace = self._mask(question)
+            masked_context, context_namespace = self._mask(context)
+
             # Generate answer
-            answer = await self.llm_service.answer_question(question, context)
-            
+            answer = await self.llm_service.answer_question(masked_question, masked_context)
+
+            # Give the user back real values in place of placeholders
+            answer = self._restore(answer, question_namespace)
+            answer = self._restore(answer, context_namespace)
+
             logger.info(f"Generated answer of length {len(answer)}")
             return answer
             

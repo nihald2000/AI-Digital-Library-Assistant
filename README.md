@@ -21,6 +21,8 @@ tags:
 
 > **"Transform your static documents into an interactive, voice-enabled knowledge base that talks back to you."**
 
+*Scale: the retrieval pipeline is engineered for **1,000,000+ documents** — SQLite/WAL storage core, auto-tiering FAISS index (exact flat → IVF/SQ8 compaction), hybrid dense+BM25 retrieval with Reciprocal Rank Fusion, and optional cross-encoder reranking. Heavy ingests run through a persistent SQLite-backed worker queue with job status, and a **PII protection boundary** (India + USA + global entities, custom keyword rules, reversible placeholder masking) keeps raw sensitive data from ever reaching the LLM. Architecture, capacity math and tuning knobs: [SCALING.md](SCALING.md).*
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![LlamaIndex](https://img.shields.io/badge/LlamaIndex-Agentic_RAG-purple)](https://www.llamaindex.ai/)

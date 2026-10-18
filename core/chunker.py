@@ -89,39 +89,51 @@ class TextChunker:
             return result
         
         text_chunks = split_text(content, separators, self.chunk_size)
-        
-        # Create chunk objects with overlap
-        for i, chunk_text in enumerate(text_chunks):
-            if not chunk_text.strip():
+
+        # Position mapping via a monotonic cursor: each chunk is searched
+        # forward from the previous chunk's start. This turns an O(N*M) full
+        # scan into ~O(len(content)) total work at 1M-chunk scale.
+        chunks = []
+        cursor = 0
+        for i, raw_chunk in enumerate(text_chunks):
+            raw_text = raw_chunk.strip()
+            if not raw_text:
                 continue
-            
-            # Calculate positions
-            start_pos = content.find(chunk_text)
-            if start_pos == -1:
-                start_pos = i * self.chunk_size
-            end_pos = start_pos + len(chunk_text)
-            
-            # Add overlap from previous chunk if not the first chunk
+
             if i > 0 and self.chunk_overlap > 0:
-                prev_chunk = text_chunks[i-1]
-                overlap_text = prev_chunk[-self.chunk_overlap:] if len(prev_chunk) > self.chunk_overlap else prev_chunk
-                chunk_text = overlap_text + " " + chunk_text
-            
-            chunk = Chunk(
-                id=self._generate_chunk_id(document_id, i),
+                prev_chunk = text_chunks[i - 1]
+                overlap_text = (
+                    prev_chunk[-self.chunk_overlap:]
+                    if len(prev_chunk) > self.chunk_overlap
+                    else prev_chunk
+                )
+                chunk_text = overlap_text + " " + raw_chunk
+            else:
+                chunk_text = raw_chunk
+
+            start_pos = content.find(raw_text, cursor)
+            if start_pos == -1:
+                # overlap-prepended or whitespace-collapsed text can drift;
+                # degrade to cursor-based estimate instead of a rescan whole doc
+                start_pos = cursor
+            else:
+                cursor = start_pos + len(raw_text)
+            end_pos = start_pos + len(raw_text)
+
+            chunks.append(Chunk(
+                id=self._generate_chunk_id(document_id, len(chunks)),
                 document_id=document_id,
                 content=chunk_text.strip(),
-                chunk_index=i,
+                chunk_index=len(chunks),
                 start_pos=start_pos,
                 end_pos=end_pos,
                 metadata={
                     "chunk_method": "recursive",
                     "original_length": len(chunk_text),
-                    "word_count": len(chunk_text.split())
-                }
-            )
-            chunks.append(chunk)
-        
+                    "word_count": len(chunk_text.split()),
+                },
+            ))
+
         return chunks
     
     def _sentence_chunk(self, document_id: str, content: str) -> List[Chunk]:
