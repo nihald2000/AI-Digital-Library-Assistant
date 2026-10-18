@@ -70,7 +70,8 @@ class LlamaIndexService:
                 else:
                     logger.warning("OpenAI embedding model requested but no API key found. Falling back to HuggingFace.")
                     Settings.embed_model = HuggingFaceEmbedding(
-                        model_name="sentence-transformers/all-MiniLM-L6-v2"
+                        model_name=getattr(self.config, "EMBEDDING_LOCAL_MODEL",
+                                           "sentence-transformers/all-MiniLM-L6-v2")
                     )
             else:
                 Settings.embed_model = HuggingFaceEmbedding(

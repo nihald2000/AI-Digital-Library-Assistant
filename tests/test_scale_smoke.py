@@ -27,10 +27,10 @@ class FakeEmbedder:
     def __init__(self, dims: int = 64):
         self.dims = dims
 
-    async def generate_embeddings(self, texts, batch_size=256):
+    async def generate_embeddings(self, texts, batch_size=256, is_query=False):
         return [self._vector(t) for t in texts]
 
-    async def generate_single_embedding(self, text):
+    async def generate_single_embedding(self, text, is_query=False):
         if text is None:
             return None
         return self._vector(text)

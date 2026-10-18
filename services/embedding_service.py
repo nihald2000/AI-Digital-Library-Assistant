@@ -37,6 +37,7 @@ class EmbeddingService:
         self._model: Any = None
         self._device = "cpu"
         self._is_openai_model = False
+        self._query_prompt: Optional[str] = None
         self._loop_clients: "OrderedDict[int, Any]" = OrderedDict()
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._cache: "OrderedDict[str, List[float]]" = OrderedDict()
@@ -67,7 +68,7 @@ class EmbeddingService:
                     raise
             else:
                 logger.warning("%s requested without OPENAI_API_KEY - falling back to local model", self.model_name)
-                self._load_local_model("sentence-transformers/all-MiniLM-L6-v2")
+                self._load_local_model(getattr(cfg, "EMBEDDING_LOCAL_MODEL", "sentence-transformers/all-MiniLM-L6-v2"))
         else:
             self._load_local_model(self.model_name)
 
@@ -90,10 +91,29 @@ class EmbeddingService:
             from sentence_transformers import SentenceTransformer
 
             self._device = "cuda" if torch.cuda.is_available() else "cpu"
-            self._model = SentenceTransformer(model_name, device=self._device)
+            if self._device == "cuda":
+                # bf16 checkpoints halve VRAM; only worthwhile on GPU (bf16 CPU
+                # emulation was measured ~10x SLOWER than fp32 on plain servers).
+                self._model = SentenceTransformer(model_name, device=self._device, model_kwargs={"dtype": "auto"})
+            else:
+                self._model = SentenceTransformer(model_name, device=self._device)
             self.model_name = model_name
             self.dimensions = self._model.get_sentence_embedding_dimension()
-            logger.info("Local embedding model %s on %s (dims=%s)", model_name, self._device, self.dimensions)
+            # Prompt-trained models (e.g. harrier) need a task instruction on the
+            # query side; resolve once and apply only when the caller marks a text
+            # as a query. Documents always encode plain.
+            wanted_prompt = getattr(self.config, "EMBEDDING_QUERY_PROMPT", "")
+            prompts = getattr(self._model, "prompts", {}) or {}
+            self._query_prompt = wanted_prompt if wanted_prompt and wanted_prompt in prompts else None
+            if self._query_prompt is None and wanted_prompt:
+                logger.info(
+                    "Local embedding model %s has no query prompt %r - queries encoded without instruction",
+                    model_name, wanted_prompt,
+                )
+            logger.info(
+                "Local embedding model %s on %s (dims=%s, query_prompt=%s)",
+                model_name, self._device, self.dimensions, self._query_prompt,
+            )
         except Exception as exc:
             logger.error("Could not load embedding model '%s': %s", model_name, exc)
             raise
@@ -135,7 +155,7 @@ class EmbeddingService:
 
     # ------------------------------------------------------------ public API
     async def generate_embeddings(
-        self, texts: Sequence[str], batch_size: Optional[int] = None
+        self, texts: Sequence[str], batch_size: Optional[int] = None, is_query: bool = False
     ) -> List[List[float]]:
         if not texts:
             return []
@@ -163,7 +183,7 @@ class EmbeddingService:
             if self._is_openai_model:
                 fetched = await self._embed_openai(cache_misses, batch_size)
             else:
-                fetched = await self._embed_local(cache_misses, batch_size)
+                fetched = await self._embed_local(cache_misses, batch_size, is_query=is_query)
             for index, text in cache_misses.items():
                 if index in fetched:
                     self._cache_put(self._cache_key(text), fetched[index])
@@ -179,10 +199,10 @@ class EmbeddingService:
             logger.warning("%s of %s inputs produced no embedding", missing, len(texts))
         return [r if r else [0.0] * (self.dimensions or self._model_dims()) for r in results]
 
-    async def generate_single_embedding(self, text: Optional[str]) -> Optional[List[float]]:
+    async def generate_single_embedding(self, text: Optional[str], is_query: bool = False) -> Optional[List[float]]:
         if not text or not text.strip():
             return None
-        embeddings = await self.generate_embeddings([text])
+        embeddings = await self.generate_embeddings([text], is_query=is_query)
         return embeddings[0] if embeddings else None
 
     async def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -253,16 +273,20 @@ class EmbeddingService:
 
     # ------------------------------------------------------------ local leg
     async def _embed_local(
-        self, index_to_text: Dict[int, str], batch_size: int
+        self, index_to_text: Dict[int, str], batch_size: int, is_query: bool = False
     ) -> Dict[int, List[float]]:
         assert self._model is not None, "local embedding model not loaded"
         loop = asyncio.get_running_loop()
+        prompt_name = self._query_prompt if is_query and self._query_prompt else None
         out: Dict[int, List[float]] = {}
         ordered = list(index_to_text.items())
         for start in range(0, len(ordered), batch_size):
             chunk = ordered[start:start + batch_size]
             batch_indices = [c[0] for c in chunk]
             batch_texts = [c[1] for c in chunk]
+            encode_kwargs: Dict[str, Any] = {}
+            if prompt_name:
+                encode_kwargs["prompt_name"] = prompt_name
             embeddings = await loop.run_in_executor(
                 None,
                 lambda: self._model.encode(
@@ -270,6 +294,7 @@ class EmbeddingService:
                     convert_to_numpy=True,
                     normalize_embeddings=True,
                     batch_size=len(batch_texts),
+                    **encode_kwargs,
                 ),
             )
             for i, embedding in zip(batch_indices, np.asarray(embeddings)):

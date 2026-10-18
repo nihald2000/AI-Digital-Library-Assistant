@@ -49,6 +49,32 @@ Because embeddings live in SQLite, the FAISS index (`.faiss` file under
 `DATA_DIR/faiss/`) is a rebuildable cache - crash recovery is simply "re-run
 compaction", no embedding re-spend.
 
+## Free embedding (offline / no API key)
+
+When `EMBEDDING_MODEL` is not an OpenAI `text-embedding-*` model, or no API key
+is configured, the vector leg runs a **free open-weight local model**. The 2026
+default is `microsoft/harrier-oss-v1-0.6b`: MIT licensed, 94 languages (incl.
+Hindi/Urdu), 1024 dims, 32K-token context, and the best sub-1B MTEB
+Multilingual v2 score of the class. Queries are automatically encoded with the
+model's `web_search_query` instruction; documents are encoded plain.
+
+To switch the whole pipeline to it, set:
+
+```
+EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
+```
+
+(Leave `EMBEDDING_DIMENSIONS` unset — truncation applies to OpenAI Matryoshka
+models only.) Alternatives via `EMBEDDING_LOCAL_MODEL`:
+`Qwen/Qwen3-Embedding-0.6B` (Apache-2.0, set `EMBEDDING_QUERY_PROMPT=query`),
+`google/embeddinggemma-300m` (your 2-vCPU Space: `microsoft/harrier-oss-v1-270m`
+is ~4x faster than the 0.6b), `BAAI/bge-m3` (the mature workhorse).
+
+> **Switching models changes embedding geometry.** Re-embed an existing library
+> once after any model change: `python scripts/reembed_library.py` (backs up
+> `library.db`, re-encodes all chunks, rebuilds + persists the FAISS index).
+> Mixing vectors from different models in one index silently degrades recall.
+
 ## Capacity math
 
 Take the default setup: `text-embedding-3-small` with `EMBEDDING_DIMENSIONS=512`.
@@ -76,6 +102,8 @@ Notes:
 | `EMBEDDING_CONCURRENCY` | 8 | Parallel in-flight embedding batches |
 | `EMBEDDING_MAX_RETRIES` | 5 | Retry count for 429 / 5xx with exponential backoff (cap 30s) |
 | `EMBEDDING_DIMENSIONS` | 512 | Matryoshka truncation (OpenAI 3rd gen only); 0 = model default |
+| `EMBEDDING_LOCAL_MODEL` | `microsoft/harrier-oss-v1-0.6b` | Free local model used when no API model runs (see note below) |
+| `EMBEDDING_QUERY_PROMPT` | `web_search_query` | Query-side instruction for prompt-trained models (`query` for Qwen3); empty disables |
 | `EMBEDDING_CACHE_ENABLED` | true | LRU reuse of identical text embeddings |
 | `EMBEDDING_CACHE_SIZE` | 50000 | Max cached entries |
 | `VECTOR_INDEX_MODE` | auto | `auto` / `flat` / `ivf` / `hnsw` |

@@ -143,8 +143,9 @@ class SearchTool:
         """Returns a list of FusionResult entries (dense-only or RRF-fused)."""
         from services.hybrid_search_service import FusionResult
 
-        # Dense leg always runs.
-        query_embedding = await self.embedding_service.generate_single_embedding(query)
+        # Dense leg always runs. is_query=True applies the model's query-side
+        # instruction (e.g. harrier's "web_search_query") when available.
+        query_embedding = await self.embedding_service.generate_single_embedding(query, is_query=True)
         if query_embedding is None:
             return []
         dense_rows = await self.vector_store.search(
@@ -341,7 +342,7 @@ class SearchTool:
             started = time.perf_counter()
 
             embed_start = time.perf_counter()
-            query_embedding = await self.embedding_service.generate_single_embedding(query)
+            query_embedding = await self.embedding_service.generate_single_embedding(query, is_query=True)
             explain_step = {
                 "step": "embedding_generation",
                 "description": "Converting the query into a dense vector",

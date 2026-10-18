@@ -43,6 +43,17 @@ class Config:
     # 512 dims = 3x less RAM/storage for FAISS and SQLite BLOBs with near-identical recall.
     # 0 = use native model dimension.
     EMBEDDING_DIMENSIONS: int = _int("EMBEDDING_DIMENSIONS", 512)
+    # Local (free, open-weight) embedding model used when the configured model
+    # is not an API model or no API key is available. Default as of 2026:
+    # microsoft/harrier-oss-v1-0.6b (MIT, 94 languages incl. Hindi, 1024 dims,
+    # 32K context, MTEB Multilingual v2 69.0 at 0.6B params). Alternatives:
+    #   Qwen/Qwen3-Embedding-0.6B | google/embeddinggemma-300m
+    #   microsoft/harrier-oss-v1-270m (4x faster on CPU: ~1.7 chunks/s vs ~0.4)
+    EMBEDDING_LOCAL_MODEL: str = os.getenv("EMBEDDING_LOCAL_MODEL", "microsoft/harrier-oss-v1-0.6b")
+    # Prompt name applied to query-side embeddings for prompt-trained models.
+    # harrier requires "web_search_query" for queries (documents are encoded plain).
+    # Qwen3 uses "query". Set empty to disable.
+    EMBEDDING_QUERY_PROMPT: str = os.getenv("EMBEDDING_QUERY_PROMPT", "web_search_query")
 
     MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "mistral-large-2407")
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-5.1-chat-latest")
