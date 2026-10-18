@@ -4,7 +4,7 @@ emoji: 📚
 colorFrom: blue
 colorTo: purple
 sdk: gradio
-sdk_version: 5.32.0
+sdk_version: 5.38.0
 app_file: app.py
 pinned: false
 license: mit
@@ -29,7 +29,7 @@ tags:
 [![ElevenLabs](https://img.shields.io/badge/ElevenLabs-Voice_AI-orange)](https://elevenlabs.io/)
 [![MCP Ready](https://img.shields.io/badge/MCP-Production_Ready-green)](https://modelcontextprotocol.io/)
 
-**[🔴 LIVE DEMO: Try it on HuggingFace Spaces](https://huggingface.co/spaces/Nihal2000/AI-Digital-Library-Assistant-MCP-Agent)**
+**[🔴 LIVE DEMO: Try it on HuggingFace Spaces](https://huggingface.co/spaces/Nihal2000/AI-Digital-Library-Assistant-Agent)**
 
 ---
 

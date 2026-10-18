@@ -25,7 +25,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           # Defaults to the repo owner's HF account; override the secret to change it.
           HF_USER: ${{ secrets.HF_USER || 'Nihal2000' }}
-          SPACE: Nihal2000/AI-Digital-Library-Assistant-MCP-Agent
+          SPACE: Nihal2000/AI-Digital-Library-Assistant-Agent
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
