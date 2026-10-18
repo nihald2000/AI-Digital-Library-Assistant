@@ -1751,4 +1751,4 @@ def create_gradio_interface():
 
 if __name__ == "__main__":
     gradio_interface = create_gradio_interface()
-    gradio_interface.launch(mcp_server=True)
+    gradio_interface.launch(mcp_server=True, ssr_mode=False)
