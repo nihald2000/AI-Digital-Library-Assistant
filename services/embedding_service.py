@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 _OPENAI_TRUNCATABLE = ("text-embedding-3-small", "text-embedding-3-large")
 
+_QUOTA_MARKERS = ("insufficient_quota", "credit_balance_exhausted", "credit_balance", "insufficient_user_quota")
+
+
+class OpenAIEmbeddingsUnavailable(RuntimeError):
+    """Permanent OpenAI auth/quotas failure - embeddings should fall back."""
+
 
 class EmbeddingService:
     def __init__(self):
@@ -71,6 +77,30 @@ class EmbeddingService:
                 self._load_local_model(getattr(cfg, "EMBEDDING_LOCAL_MODEL", "sentence-transformers/all-MiniLM-L6-v2"))
         else:
             self._load_local_model(self.model_name)
+
+    def _disable_openai_leg(self, exc: Exception) -> None:
+        """Permanent OpenAI failure (quota/auth): local model takes over now."""
+        self._is_openai_model = False
+        self._loop_clients.clear()
+        self.dimensions = None  # re-resolved by the local model's own geometry
+        self._query_prompt = None
+        self._model = None
+        try:
+            self._load_local_model(getattr(self.config, "EMBEDDING_LOCAL_MODEL",
+                                           "sentence-transformers/all-MiniLM-L6-v2"))
+            logger.error(
+                "OpenAI embeddings unavailable (%s: %s) - permanently switched the vector leg to the "
+                "free local model '%s' for this session.",
+                exc.__class__.__name__, str(exc)[:200], self.model_name,
+            )
+            logger.warning(
+                "Heads-up: vectors previously embedded by the OpenAI model are not compatible with the "
+                "new geometry. If the library was ingested with OpenAI embeddings, re-embed once with: "
+                "python scripts/reembed_library.py",
+            )
+        except Exception as load_exc:
+            logger.error("Local embedding fallback could not load a model either: %s", load_exc)
+            raise
 
     def _get_async_client(self) -> Any:
         key = id(asyncio.get_running_loop())
@@ -181,9 +211,15 @@ class EmbeddingService:
         fetched: Dict[int, List[float]] = {}
         if cache_misses:
             if self._is_openai_model:
-                fetched = await self._embed_openai(cache_misses, batch_size)
+                try:
+                    fetched = await self._embed_openai(cache_misses, batch_size)
+                except OpenAIEmbeddingsUnavailable as exc:
+                    # quota exhausted / key dead: stop paying the retry tax and
+                    # serve the vector leg from the free local model instead.
+                    self._disable_openai_leg(exc)
+                    fetched = await self._embed_local(cache_misses, batch_size, is_query=is_query)
             else:
-                fetched = await self._embed_local(cache_misses, batch_size, is_query=is_query)
+                fetched = await self._embed_local(cache_misses, batch_size)
             for index, text in cache_misses.items():
                 if index in fetched:
                     self._cache_put(self._cache_key(text), fetched[index])
@@ -234,11 +270,17 @@ class EmbeddingService:
             *[loop.create_task(request(b)) for b in batches], return_exceptions=True
         )
         merged: Dict[int, List[float]] = {}
+        permanent: Optional[BaseException] = None
         for result in results:
             if isinstance(result, BaseException):
-                logger.error("Embedding request failed permanently: %s", result)
+                if isinstance(result, OpenAIEmbeddingsUnavailable):
+                    permanent = permanent or result
+                else:
+                    logger.error("Embedding request failed permanently: %s", result)
                 continue
             merged.update(result)
+        if permanent:
+            raise permanent
         return merged
 
     async def _openai_request_with_retry(
@@ -255,6 +297,9 @@ class EmbeddingService:
                 data = sorted(response.data, key=lambda d: d.index)
                 return {i: d.embedding for i, d in zip(indices, data)}
             except Exception as exc:
+                if self._permanent_openai_failure(exc):
+                    # quota exhausted / key revoked - retrying will not help
+                    raise OpenAIEmbeddingsUnavailable(str(exc)) from exc
                 attempt += 1
                 if attempt > self._max_retries:
                     raise
@@ -265,6 +310,25 @@ class EmbeddingService:
                     attempt, self._max_retries, exc.__class__.__name__, exc, delay,
                 )
                 await asyncio.sleep(delay)
+
+    @staticmethod
+    def _permanent_openai_failure(exc: Exception) -> bool:
+        """True for auth/quota errors a retry can never fix."""
+        status = getattr(exc, "status_code", None)
+        if status in (401, 403):
+            return True
+        body = getattr(exc, "body", None)
+        code = ""
+        if isinstance(body, dict):
+            code = str(body.get("code") or "")
+        message = ""
+        try:
+            message = str(exc)
+        except Exception:
+            message = ""
+        if any(marker in code for marker in _QUOTA_MARKERS):
+            return True
+        return any(marker in message for marker in _QUOTA_MARKERS)
 
     @staticmethod
     def _batch_indices(indices: Sequence[int], batch_size: int):
