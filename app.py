@@ -297,13 +297,22 @@ class ContentOrganizerMCPServer:
             logger.error(f"Podcast generation failed: {str(e)}")
             return {"success": False, "error": str(e)}
 
-    async def answer_question_async(self, question: str, context_filter: Optional[Dict] = None) -> Dict[str, Any]:
+    async def answer_question_async(
+        self, question: str, context_filter: Optional[Dict] = None,
+        mask_pii: bool = True,
+    ) -> Dict[str, Any]:
         try:
             search_results = await self.search_tool.search(question, top_k=5, filters=context_filter)
             if not search_results:
                 return {"success": False, "error": "No relevant context found in your documents. Please make sure you have uploaded relevant documents.", "question": question}
-            answer = await self.generative_tool.answer_question(question, search_results)
-            return {"success": True, "question": question, "answer": answer, "sources": [result.to_dict() for result in search_results], "confidence": "high" if len(search_results) >= 3 else "medium"}
+            answer = await self.generative_tool.answer_question(question, search_results, mask_pii=mask_pii)
+            # DoChat PII display: what the agent actually received for this turn
+            if mask_pii:
+                masked = self.pii_service.mask_for_agent(question, namespace=f"ui:chatview:{uuid.uuid4().hex}", register=False)
+                pii_meta = {"on": True, "masked_view": masked.masked_text, "mask_count": masked.masked_count}
+            else:
+                pii_meta = {"on": False, "masked_view": question, "mask_count": 0}
+            return {"success": True, "question": question, "answer": answer, "sources": [result.to_dict() for result in search_results], "confidence": "high" if len(search_results) >= 3 else "medium", "pii": pii_meta}
         except Exception as e:
             logger.error(f"Question answering failed: {str(e)}")
             return {"success": False, "error": str(e), "question": question}
@@ -745,26 +754,60 @@ def generate_tags_for_document(doc_choice, custom_text, max_tags):
         logger.error(f"Tag generation error: {str(e)}")
         return f"❌ Error: {str(e)}"
 
-def ask_question(question):
-    if not question.strip():
-        return "Please enter a question"
-    try:
-        result = mcp_server.run_async(mcp_server.answer_question_async(question))
-        if result["success"]:
-            output_str = f"❓ Question: {result['question']}\n\n"
-            output_str += f"💡 Answer:\n{result['answer']}\n\n"
-            output_str += f"🎯 Confidence: {result['confidence']}\n\n"
-            output_str += f"📚 Sources Used ({len(result['sources'])}):\n"
-            for i, source_item in enumerate(result['sources'], 1):
-                filename = source_item.get('metadata', {}).get('document_filename', 'Unknown')
-                output_str += f"\n{i}. 📄 {filename}\n"
-                output_str += f"   📝 Excerpt: {source_item['content'][:150]}...\n"
-                output_str += f"   📊 Relevance: {source_item['score']:.3f}\n"
-            return output_str
-        else:
-            return f"❌ {result.get('error', 'Failed to answer question')}"
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+def _dochat_pii_banner(pii_meta):
+    """Visible-in-output PII status line shown after every DoChat reply."""
+    if not pii_meta:
+        return "🆕 New conversation."
+    if pii_meta.get("on"):
+        masked = pii_meta.get("masked_view") or ""
+        count = pii_meta.get("mask_count") or 0
+        if count:
+            return (
+                f"🛡️ **PII masking: ON** — {count} identifier(s) hidden from the agent this turn.\n"
+                f"- Agent received: `{masked}`\n"
+                f"- Your answer above shows the real values (restored in memory only)."
+            )
+        return "🛡️ **PII masking: ON** — no sensitive identifiers were found in this turn."
+    return ("⚠️ **PII masking: OFF** — the agent saw your raw text this turn. "
+            "Tick 🛡️ back on to hide personal identifiers.")
+
+def _dochat_sources_text(sources):
+    lines = []
+    for i, source_item in enumerate(sources or [], 1):
+        filename = source_item.get('metadata', {}).get('document_filename', 'Unknown')
+        lines.append(f"{i}. 📄 {filename}")
+        lines.append(f"   📝 Excerpt: {str(source_item.get('content', ''))[:200]}…")
+        score = source_item.get('score')
+        if score is not None:
+            lines.append(f"   📊 Relevance: {score:.3f}")
+    return "\n".join(lines) or "No sources used."
+
+def dochat_send(question, history, mask_pii_on):
+    """ChatGPT/Claude-style turn: user bubble + assistant bubble, PII visible."""
+    history = list(history or [])
+    question = (question or "").strip()
+    if not question:
+        return history, gr.update(), "🆕 Type a question to start.", _dochat_sources_text([])
+    history.append({"role": "user", "content": question})
+    result = mcp_server.run_async(mcp_server.answer_question_async(question, mask_pii=bool(mask_pii_on)))
+    sources_text = _dochat_sources_text(result.get("sources", []))
+    if not result.get("success"):
+        meta = result.get("pii") or {"on": bool(mask_pii_on), "masked_view": "", "mask_count": 0}
+        history.append({"role": "assistant", "content": f"❌ {result.get('error', 'Failed to answer question')}"})
+    else:
+        meta = result.get("pii") or {"on": bool(mask_pii_on), "masked_view": "", "mask_count": 0}
+        answer = result.get("answer", "")
+        assistant_content = (
+            f"{answer}\n\n"
+            f"—\n🎯 Confidence: {result.get('confidence', 'medium')} · "
+            f"📚 {len(result.get('sources', []))} source(s) — see the *Sources used* panel below."
+        )
+        history.append({"role": "assistant", "content": assistant_content})
+    return history, "", _dochat_pii_banner(meta), sources_text
+
+def dochat_clear():
+    return [], "🆕 New conversation started. Ask anything about your library — 🛡️ PII masking status shows here after every reply.", ""
+
 
 def delete_document_from_library(document_id):
     if not document_id:
@@ -1669,16 +1712,34 @@ def create_gradio_interface():
                     ]
                 )
                 
-            with gr.Tab("❓ Ask Questions"):
+            with gr.Tab("🤖 DoChat"):
+                gr.Markdown("""### 🤖 DoChat — your library, ChatGPT-style
+                The assistant searches all your uploaded documents, answers with sources, and keeps the chat flowing.
+                🛡️ By default PII masking is **on**: the agent only ever sees placeholders — your reply shows real values.""")
+                chat_display = gr.Chatbot(
+                    type="messages",
+                    label="",
+                    height=520,
+                    show_copy_button=True,
+                    avatar_images=("👤", "🤖"),
+                    placeholder="Ask anything about your documents… e.g. “Explain the attention mechanism from the paper you have”",
+                    render_markdown=True,
+                )
                 with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("""### Ask Questions About Your Documents
-                        The AI will search through all your uploaded documents to find relevant information 
-                        and provide comprehensive answers with sources.""")
-                        qa_question_input = gr.Textbox(label="Your Question", placeholder="Ask anything about your documents...", lines=3)
-                        qa_btn_action = gr.Button("❓ Get Answer", variant="primary", size="lg")
-                    with gr.Column():
-                        qa_output_display = gr.Textbox(label="AI Answer", lines=20, placeholder="Answer will appear here with sources...")
+                    qa_question_input = gr.Textbox(
+                        placeholder="Type your question and press Enter, or click Send…",
+                        show_label=False, lines=1, scale=9, container=False, autofocus=True
+                    )
+                    qa_btn_action = gr.Button("➤ Send", variant="primary", scale=1)
+                dochat_pii_toggle = gr.Checkbox(
+                    label="🛡️ PII masking ON (agent sees [EMAIL_1]/[AADHAAR_1] placeholders; your answer shows real values) — visible below after every reply",
+                    value=True
+                )
+                dochat_pii_meta = gr.Markdown("🆕 New conversation. Ask anything about your library.")
+                with gr.Accordion("📚 Sources used in the last answer", open=False):
+                    qa_sources_display = gr.Textbox(label="", lines=8, show_label=False, show_copy_button=True)
+                dochat_clear_btn = gr.Button("🗑️ New chat", variant="secondary", size="sm")
+                chat_state = gr.State([])
 
         all_dropdowns_to_update = [delete_doc_dropdown_visible, doc_dropdown_content, doc_dropdown_tag_visible, pii_doc_dropdown, podcast_doc_selector]
 
@@ -1707,7 +1768,22 @@ def create_gradio_interface():
         
         search_btn_action.click(perform_search, inputs=[search_query_input, search_top_k_slider], outputs=[search_output_display])
         tag_btn_action.click(generate_tags_for_document, inputs=[doc_dropdown_tag_visible, tag_text_input, max_tags_slider], outputs=[tag_output_display])
-        qa_btn_action.click(ask_question, inputs=[qa_question_input], outputs=[qa_output_display])
+
+        # ---- DoChat tab (ChatGPT/Claude-style, PII visible per turn) ----
+        _dochat_outputs = [chat_display, qa_question_input, dochat_pii_meta, qa_sources_display]
+        qa_btn_action.click(
+            dochat_send,
+            inputs=[qa_question_input, chat_state, dochat_pii_toggle],
+            outputs=_dochat_outputs,
+        ).then(lambda h: h, inputs=[chat_display], outputs=[chat_state])
+        qa_question_input.submit(
+            dochat_send,
+            inputs=[qa_question_input, chat_state, dochat_pii_toggle],
+            outputs=_dochat_outputs,
+        ).then(lambda h: h, inputs=[chat_display], outputs=[chat_state])
+        dochat_clear_btn.click(dochat_clear, outputs=_dochat_outputs).then(
+            lambda: [], None, [chat_state]
+        )
 
         # ---- PII Protection tab ----
         pii_btn_detect.click(

@@ -104,41 +104,54 @@ class GenerativeTool:
             logger.error(f"Error categorizing content: {str(e)}")
             return "Uncategorized"
     
-    async def answer_question(self, question: str, context_results: List[SearchResult] = None) -> str:
-        """Answer a question using the provided context or RAG"""
+    async def answer_question(
+        self, question: str, context_results: List[SearchResult] = None,
+        mask_pii: bool = True,
+    ) -> str:
+        """Answer a question using the provided context or RAG.
+
+        mask_pii=True (default) hides identifiers from the LLM and restores
+        real values in the reply. mask_pii=False is the user's explicit opt-out
+        (DoChat checkbox) - the agent then sees raw text.
+        """
         try:
             if not question.strip():
                 return "No question provided."
-            
+
             logger.info(f"Answering question: {question[:100]}...")
-            
+
             # If no context provided and search tool is available, search for relevant context
             if not context_results and self.search_tool:
                 logger.info("No context provided, searching for relevant information")
                 context_results = await self.search_tool.search(question, top_k=5)
-            
+
             # Prepare context from search results
             if context_results:
                 context_texts = []
                 for result in context_results:
                     context_texts.append(f"Source: {result.document_id}\nContent: {result.content}\n")
-                
+
                 context = "\n---\n".join(context_texts)
                 logger.info(f"Using context from {len(context_results)} sources")
             else:
                 context = ""
                 logger.info("No context available for answering question")
-            
+
             # PII boundary: question and context are masked before the LLM sees them
-            masked_question, question_namespace = self._mask(question)
-            masked_context, context_namespace = self._mask(context)
+            question_namespace = context_namespace = None
+            if mask_pii:
+                masked_question, question_namespace = self._mask(question)
+                masked_context, context_namespace = self._mask(context)
+            else:
+                masked_question, masked_context = question, context
 
             # Generate answer
             answer = await self.llm_service.answer_question(masked_question, masked_context)
 
             # Give the user back real values in place of placeholders
-            answer = self._restore(answer, question_namespace)
-            answer = self._restore(answer, context_namespace)
+            if mask_pii:
+                answer = self._restore(answer, question_namespace)
+                answer = self._restore(answer, context_namespace)
 
             logger.info(f"Generated answer of length {len(answer)}")
             return answer
