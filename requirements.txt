@@ -1,6 +1,6 @@
 gradio[mcp]==5.38.0
 anthropic>=0.7.0
-mistralai
+mistralai>=1.5.0,<2.0.0
 sentence-transformers>=2.2.2
 transformers>=4.30.0
 torch>=2.0.0
@@ -30,6 +30,7 @@ llama-index-llms-anthropic
 llama-index-embeddings-huggingface
 elevenlabs>=1.0.0
 spaces
+requests>=2.31.0
 websockets>=12.0
 # Optional: NER-based PII detection of person names / orgs (PII_NER_ENABLED=true)
 # pip install presidio-analyzer && python -m spacy download en_core_web_sm
