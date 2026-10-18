@@ -141,7 +141,9 @@ class ContentOrganizerMCPServer:
         """MCP Tool: auto-detect PII and return the masked placeholder view."""
         try:
             disabled = json.loads(disabled_types_json) if disabled_types_json else None
-            result = self.pii_service.mask_for_agent(text or "", namespace=f"ui:{uuid.uuid4().hex}")
+            result = self.pii_service.mask_for_agent(
+                text or "", namespace=f"ui:{uuid.uuid4().hex}", disabled_types=disabled
+            )
             rows = [f.to_table_row() for f in result.findings]
             return {
                 "success": True,
@@ -383,32 +385,29 @@ def get_document_choices():
         return []
 
 def refresh_library():
+    """First half of every refresh: stats list + fresh choices.
+
+    Callers write the choices into ``doc_choices_state``; the state's
+    .change handler broadcasts gr.update to every document dropdown
+    (library, content, tags, delete, PII scan, podcast) so new/deleted
+    documents appear everywhere with one code path.
+    """
     doc_list_refreshed = get_document_list()
     doc_choices_refreshed = get_document_choices()
     logger.info(f"Refreshing library. Found {len(doc_choices_refreshed)} choices.")
-    return (
-        doc_list_refreshed,
-        gr.update(choices=doc_choices_refreshed),
-        gr.update(choices=doc_choices_refreshed),
-        gr.update(choices=doc_choices_refreshed)
-    )
+    return doc_list_refreshed, doc_choices_refreshed
 
 def upload_and_process_file(file):
     if file is None:
         doc_list_initial = get_document_list()
         doc_choices_initial = get_document_choices()
-        return (
-            "No file uploaded", "", doc_list_initial,
-            gr.update(choices=doc_choices_initial),
-            gr.update(choices=doc_choices_initial),
-            gr.update(choices=doc_choices_initial)
-        )
+        return ("No file uploaded", "", doc_list_initial, doc_choices_initial)
     try:
         file_path = file.name if hasattr(file, 'name') else str(file)
         file_type = Path(file_path).suffix.lower().strip('.') # Ensure suffix is clean
         logger.info(f"Processing file: {file_path}, type: {file_type}")
         result = mcp_server.run_async(mcp_server.ingest_document_async(file_path, file_type))
-        
+
         doc_list_updated = get_document_list()
         doc_choices_updated = get_document_choices()
 
@@ -417,17 +416,13 @@ def upload_and_process_file(file):
                 f"✅ Success: {result['message']}\nDocument ID: {result['document_id']}\nChunks created: {result['chunks_created']}",
                 result["document_id"],
                 doc_list_updated,
-                gr.update(choices=doc_choices_updated),
-                gr.update(choices=doc_choices_updated),
-                gr.update(choices=doc_choices_updated)
+                doc_choices_updated,
             )
         else:
             return (
                 f"❌ Error: {result.get('error', 'Unknown error')}", "",
                 doc_list_updated,
-                gr.update(choices=doc_choices_updated),
-                gr.update(choices=doc_choices_updated),
-                gr.update(choices=doc_choices_updated)
+                doc_choices_updated,
             )
     except Exception as e:
         logger.error(f"Error processing file: {str(e)}")
@@ -436,9 +431,7 @@ def upload_and_process_file(file):
         return (
             f"❌ Error: {str(e)}", "",
             doc_list_error,
-            gr.update(choices=doc_choices_error),
-            gr.update(choices=doc_choices_error),
-            gr.update(choices=doc_choices_error)
+            doc_choices_error,
         )
 
 def perform_search(query, top_k):
@@ -500,16 +493,16 @@ def pii_detect_and_mask(text, include_india, include_us, include_ner, disabled_t
         logger.error(f"PII detect error: {str(e)}")
         return text, [], f"❌ Error: {str(e)}"
 
-def pii_scan_document(doc_choice):
-    """Load a library document and auto-detect its PII."""
+def pii_scan_document(doc_choice, include_in, include_us, include_ner, disabled_types):
+    """Load a library document and auto-detect its PII (respects toggles)."""
     try:
         if not doc_choice:
-            return "", [], "Select a document first."
+            return "", [], "Select a document from your library first."
         doc_id = doc_choice
         content = mcp_server.run_async(mcp_server.get_document_content_async(doc_id)) or ""
         if not content.strip():
             return "", [], "Document has no extractable text content."
-        return pii_detect_and_mask(content[:50000], True, True, config.config.PII_NER_ENABLED, [])
+        return pii_detect_and_mask(content[:50000], include_in, include_us, include_ner, disabled_types)
     except Exception as e:
         logger.error(f"PII document scan error: {str(e)}")
         return "", [], f"❌ Error: {str(e)}"
@@ -601,8 +594,10 @@ def refresh_jobs_tables():
         return [], f"❌ Error: {str(e)}"
 
 def refresh_jobs_ui():
+    """Job table + worker status; also refreshes document dropdowns because
+    finishing queue jobs add new library documents in the background."""
     rows, summary = refresh_jobs_tables()
-    return rows, summary
+    return rows, summary, get_document_choices()
 
 def lookup_job_ui(job_id):
     if not job_id or not job_id.strip():
@@ -764,13 +759,7 @@ def delete_document_from_library(document_id):
     if not document_id:
         doc_list_current = get_document_list()
         doc_choices_current = get_document_choices()
-        return (
-            "No document selected to delete.",
-            doc_list_current,
-            gr.update(choices=doc_choices_current),
-            gr.update(choices=doc_choices_current),
-            gr.update(choices=doc_choices_current)
-        )
+        return ("No document selected to delete.", doc_list_current, doc_choices_current)
     try:
         delete_doc_store_result = mcp_server.run_async(mcp_server.document_store.delete_document(document_id))
         delete_vec_store_result = mcp_server.run_async(mcp_server.vector_store.delete_document(document_id))
@@ -780,7 +769,7 @@ def delete_document_from_library(document_id):
             msg += f"🗑️ Document {document_id[:8]}... deleted from document store. "
         else:
             msg += f"❌ Failed to delete document {document_id[:8]}... from document store. "
-        
+
         if delete_vec_store_result:
              msg += "Embeddings deleted from vector store."
         else:
@@ -789,24 +778,12 @@ def delete_document_from_library(document_id):
 
         doc_list_updated = get_document_list()
         doc_choices_updated = get_document_choices()
-        return (
-            msg,
-            doc_list_updated,
-            gr.update(choices=doc_choices_updated),
-            gr.update(choices=doc_choices_updated),
-            gr.update(choices=doc_choices_updated)
-        )
+        return (msg, doc_list_updated, doc_choices_updated)
     except Exception as e:
         logger.error(f"Error deleting document: {str(e)}")
         doc_list_error = get_document_list()
         doc_choices_error = get_document_choices()
-        return (
-            f"❌ Error deleting document: {str(e)}",
-            doc_list_error,
-            gr.update(choices=doc_choices_error),
-            gr.update(choices=doc_choices_error),
-            gr.update(choices=doc_choices_error)
-        )
+        return (f"❌ Error deleting document: {str(e)}", doc_list_error, doc_choices_error)
 
 # Voice conversation state - global scope
 voice_conversation_state = {
@@ -1232,7 +1209,8 @@ def create_gradio_interface():
                                 label="Scan a Library Document (optional)",
                                 choices=get_document_choices(),
                                 value=None,
-                                interactive=True
+                                interactive=True,
+                                info="Filled from your library - refreshes after uploads, queue jobs, or the library Refresh button"
                             )
                             pii_scan_doc_btn = gr.Button("📄 Scan Library Document", variant="secondary")
                             pii_input_text = gr.Textbox(
@@ -1691,15 +1669,29 @@ def create_gradio_interface():
                     with gr.Column():
                         qa_output_display = gr.Textbox(label="AI Answer", lines=20, placeholder="Answer will appear here with sources...")
 
-        all_dropdowns_to_update = [delete_doc_dropdown_visible, doc_dropdown_content, doc_dropdown_tag_visible]
-        
-        refresh_outputs = [document_list_display] + [dd for dd in all_dropdowns_to_update]
+        all_dropdowns_to_update = [delete_doc_dropdown_visible, doc_dropdown_content, doc_dropdown_tag_visible, pii_doc_dropdown, podcast_doc_selector]
+
+        # New choices flow through a shared State: refresh/upload/delete/queue
+        # handlers return plain choice lists, and a single .change handler
+        # broadcasts gr.update to every document dropdown above.
+        doc_choices_state = gr.State([])
+
+        def _broadcast_document_choices(choices):
+            return [gr.update(choices=choices) for _ in all_dropdowns_to_update]
+
+        doc_choices_state.change(
+            _broadcast_document_choices,
+            inputs=[doc_choices_state],
+            outputs=all_dropdowns_to_update,
+        )
+
+        refresh_outputs = [document_list_display, doc_choices_state]
         refresh_btn_library.click(fn=refresh_library, outputs=refresh_outputs)
-        
-        upload_outputs = [upload_output_display, doc_id_output_display, document_list_display] + [dd for dd in all_dropdowns_to_update]
+
+        upload_outputs = [upload_output_display, doc_id_output_display, document_list_display, doc_choices_state]
         upload_btn_process.click(upload_and_process_file, inputs=[file_input_upload], outputs=upload_outputs)
 
-        delete_outputs = [delete_output_display, document_list_display] + [dd for dd in all_dropdowns_to_update]
+        delete_outputs = [delete_output_display, document_list_display, doc_choices_state]
         delete_btn.click(delete_document_from_library, inputs=[delete_doc_dropdown_visible], outputs=delete_outputs)
         
         search_btn_action.click(perform_search, inputs=[search_query_input, search_top_k_slider], outputs=[search_output_display])
@@ -1714,7 +1706,7 @@ def create_gradio_interface():
         )
         pii_scan_doc_btn.click(
             pii_scan_document,
-            inputs=[pii_doc_dropdown],
+            inputs=[pii_doc_dropdown, pii_include_in, pii_include_us, pii_include_ner, pii_disabled_types],
             outputs=[pii_masked_text, pii_findings_df, pii_status]
         )
         rule_add_btn.click(
@@ -1735,7 +1727,7 @@ def create_gradio_interface():
             inputs=[queue_dir_input, queue_concurrency_input],
             outputs=[queue_status, jobs_df, queue_stats_display]
         )
-        jobs_refresh_btn.click(fn=refresh_jobs_ui, outputs=[jobs_df, queue_stats_display])
+        jobs_refresh_btn.click(fn=refresh_jobs_ui, outputs=[jobs_df, queue_stats_display, doc_choices_state])
         job_lookup_btn.click(lookup_job_ui, inputs=[job_id_input], outputs=[job_lookup_output])
 
         # Load dashboard stats on interface load
@@ -1744,9 +1736,9 @@ def create_gradio_interface():
             outputs=[total_docs, total_chunks, storage_size, recent_docs, vector_status, llm_status, voice_status]
         )
         
-        interface.load(fn=refresh_library, outputs=refresh_outputs)
+        interface.load(fn=refresh_library, outputs=[document_list_display, doc_choices_state])
         interface.load(fn=pii_refresh_rules, outputs=[pii_rules_df])
-        interface.load(fn=refresh_jobs_ui, outputs=[jobs_df, queue_stats_display])
+        interface.load(fn=refresh_jobs_ui, outputs=[jobs_df, queue_stats_display, doc_choices_state])
         return interface
 
 if __name__ == "__main__":

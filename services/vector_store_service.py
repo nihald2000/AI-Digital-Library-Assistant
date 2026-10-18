@@ -111,7 +111,12 @@ class VectorStoreService:
             stored_dim = await self._stored_dimension()
             self._dimension = stored_dim or self._resolve_dimension()
             logger.info("Rebuilding index for %s existing vectors...", active)
-            self._tier = self._make_tier(self.mode if self.mode != "auto" else "ivf", self._dimension, active)
+            rebuild_kind = self.mode
+            if self.mode == "auto":
+                # tiny libraries must stay flat: IVF clustering cannot train
+                # on fewer vectors than clusters (faiss 'nx >= k').
+                rebuild_kind = "ivf" if active >= self.config.IVF_SWITCH_THRESHOLD else "flat"
+            self._tier = self._make_tier(rebuild_kind, self._dimension, active)
             await self._build_from_sqlite()
             await self.persist(force=True)
         # auto-tier: if the persisted tier is flat but the corpus has outgrown
@@ -377,6 +382,17 @@ class VectorStoreService:
     async def _train_ivf(self, tier: "_IVFTier") -> None:
         """Train + populate an IVF tier from SQLite in bounded RAM."""
         active = await self._count_active()
+        if active < 64:
+            # too few vectors to cluster (faiss 'nx >= k'): serve flat instead
+            tier.index = faiss.IndexIDMap2(faiss.IndexFlatIP(self._dimension))
+            tier.trained = True
+            tier.kind = "flat"
+            async for row in self._stream_vectors():
+                vec = np.frombuffer(row[1], dtype="float32").reshape(1, -1)
+                vec = _normalize(vec)
+                tier.add([row[0]], vec)
+            logger.info("Only %s active vectors - IVF skipped, staying flat", active)
+            return
         auto_nlist = self.config.IVF_NLIST or int(min(16384, max(1024, 4 * max(active, 1) ** 0.5)))
         # FAISS wants >= 30-39x nlist training points; shrink nlist to match
         # the sample we can actually provide (benign warning otherwise).
