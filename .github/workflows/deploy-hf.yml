@@ -1,0 +1,38 @@
+name: Deploy to Hugging Face Space
+
+# Mirrors main -> the HF Space on every push so the live demo always matches
+# the repo. Space repo history is overwritten (force) so the two stay in lockstep.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}   # manual re-run from the Actions tab
+
+concurrency:
+  group: deploy-hf-space
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so the push is a clean mirror
+
+      - name: Push to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Defaults to the repo owner's HF account; override the secret to change it.
+          HF_USER: ${{ secrets.HF_USER || 'Nihal2000' }}
+          SPACE: Nihal2000/AI-Digital-Library-Assistant-MCP-Agent
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add space "https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${SPACE}"
+          git push --force space main:main
+
+      - name: Deployment summary
+        run: |
+          echo "### Deployed to Hugging Face :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "https://huggingface.co/spaces/${SPACE}" >> $GITHUB_STEP_SUMMARY
