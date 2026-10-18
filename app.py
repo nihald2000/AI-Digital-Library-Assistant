@@ -3,6 +3,7 @@ import os
 import asyncio
 import json
 import logging
+import shutil
 import tempfile
 import uuid
 from datetime import datetime
@@ -135,6 +136,19 @@ class ContentOrganizerMCPServer:
         except Exception as e:
             logger.error(f"Document ingestion failed: {str(e)}")
             return {"success": False, "error": str(e), "message": "Failed to process document"}
+
+    async def enqueue_document_async(self, file_path: str) -> Dict[str, Any]:
+        """Upload path: hand a saved file to the background ingestion worker.
+
+        Keeps HTTP/gradio requests snappy - CPU-slow work (OCR, page parsing,
+        local embeddings at ~1 chunk/s) must not live in the request path.
+        Progress and failures stay auditable in the Ingestion Queue tab.
+        """
+        try:
+            return await self.ingest_queue.enqueue("document", file_path)
+        except Exception as e:
+            logger.error(f"Queue enqueue failed for {file_path}: {str(e)}")
+            return {"success": False, "error": str(e)}
 
     # ------------------------------------------------------- PII protection
     async def pii_scan_async(self, text: str, disabled_types_json: Optional[str] = None) -> Dict[str, Any]:
@@ -398,41 +412,38 @@ def refresh_library():
     return doc_list_refreshed, doc_choices_refreshed
 
 def upload_and_process_file(file):
+    """Queue an uploaded file for background ingestion; returns immediately.
+
+    Local (Space CPU) embedding at ~0.4-2 chunks/s means a 60-chunk PDF used to
+    block the browser for minutes; the persistent queue owns that latency now.
+    """
     if file is None:
-        doc_list_initial = get_document_list()
-        doc_choices_initial = get_document_choices()
-        return ("No file uploaded", "", doc_list_initial, doc_choices_initial)
+        return ("No file uploaded", "", get_document_list(), get_document_choices())
     try:
-        file_path = file.name if hasattr(file, 'name') else str(file)
-        file_type = Path(file_path).suffix.lower().strip('.') # Ensure suffix is clean
-        logger.info(f"Processing file: {file_path}, type: {file_type}")
-        result = mcp_server.run_async(mcp_server.ingest_document_async(file_path, file_type))
+        file_path = file.name if hasattr(file, "name") else str(file)
+        logger.info(f"Processing file: {file_path}")
 
-        doc_list_updated = get_document_list()
-        doc_choices_updated = get_document_choices()
+        # gradio temp files can be cleaned up after the request - archive the
+        # upload into our own folder before handing the path to the worker.
+        upload_dir = Path(config.config.DOCUMENT_STORE_PATH) / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        target = upload_dir / f"{stamp}_{Path(file_path).name}"
+        shutil.copy2(file_path, target)
 
-        if result["success"]:
-            return (
-                f"✅ Success: {result['message']}\nDocument ID: {result['document_id']}\nChunks created: {result['chunks_created']}",
-                result["document_id"],
-                doc_list_updated,
-                doc_choices_updated,
+        result = mcp_server.run_async(mcp_server.enqueue_document_async(str(target)))
+        if result.get("success"):
+            job_id = (result.get("job_id") or "")[:12]
+            status = (
+                f"✅ Uploaded: queued as background job {job_id}…\n"
+                "The ⏳ Ingestion Queue tab shows progress; the document appears in the library when the worker finishes."
             )
         else:
-            return (
-                f"❌ Error: {result.get('error', 'Unknown error')}", "",
-                doc_list_updated,
-                doc_choices_updated,
-            )
+            status = f"❌ Queue error: {result.get('error', 'unknown error')}"
+        return (status, "", get_document_list(), get_document_choices())
     except Exception as e:
-        logger.error(f"Error processing file: {str(e)}")
-        doc_list_error = get_document_list()
-        doc_choices_error = get_document_choices()
-        return (
-            f"❌ Error: {str(e)}", "",
-            doc_list_error,
-            doc_choices_error,
-        )
+        logger.error(f"Error queueing upload: {str(e)}")
+        return (f"❌ Error: {str(e)}", "", get_document_list(), get_document_choices())
 
 def perform_search(query, top_k):
     if not query.strip():

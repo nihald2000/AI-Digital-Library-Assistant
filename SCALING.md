@@ -53,22 +53,24 @@ compaction", no embedding re-spend.
 
 When `EMBEDDING_MODEL` is not an OpenAI `text-embedding-*` model, or no API key
 is configured, the vector leg runs a **free open-weight local model**. The 2026
-default is `microsoft/harrier-oss-v1-0.6b`: MIT licensed, 94 languages (incl.
-Hindi/Urdu), 1024 dims, 32K-token context, and the best sub-1B MTEB
-Multilingual v2 score of the class. Queries are automatically encoded with the
-model's `web_search_query` instruction; documents are encoded plain.
+default is `microsoft/harrier-oss-v1-270m`: MIT licensed, 94 languages, 640
+dims, ~1.7 chunks/s on desktop CPU (measured; ~4x faster than the 0.6b at
+~0.4 chunks/s) with near-class-leading MTEB Multilingual v2 quality. Queries
+are automatically encoded with the model's `web_search_query` instruction;
+documents are encoded plain.
 
 To switch the whole pipeline to it, set:
 
 ```
-EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
+EMBEDDING_MODEL=microsoft/harrier-oss-v1-270m
 ```
 
 (Leave `EMBEDDING_DIMENSIONS` unset — truncation applies to OpenAI Matryoshka
-models only.) Alternatives via `EMBEDDING_LOCAL_MODEL`:
-`Qwen/Qwen3-Embedding-0.6B` (Apache-2.0, set `EMBEDDING_QUERY_PROMPT=query`),
-`google/embeddinggemma-300m` (your 2-vCPU Space: `microsoft/harrier-oss-v1-270m`
-is ~4x faster than the 0.6b), `BAAI/bge-m3` (the mature workhorse).
+models only.) Prefer maximum retrieval quality on faster hosts? Set
+`EMBEDDING_LOCAL_MODEL=microsoft/harrier-oss-v1-0.6b` (1024 dims, 32K context,
+top MTEB-Multilingual for sub-1B). Other options: `Qwen/Qwen3-Embedding-0.6B`
+(Apache-2.0, set `EMBEDDING_QUERY_PROMPT=query`), `google/embeddinggemma-300m`,
+`BAAI/bge-m3`.
 
 > **Switching models changes embedding geometry.** Re-embed an existing library
 > once after any model change: `python scripts/reembed_library.py` (backs up

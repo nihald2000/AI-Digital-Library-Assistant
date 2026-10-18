@@ -44,12 +44,11 @@ class Config:
     # 0 = use native model dimension.
     EMBEDDING_DIMENSIONS: int = _int("EMBEDDING_DIMENSIONS", 512)
     # Local (free, open-weight) embedding model used when the configured model
-    # is not an API model or no API key is available. Default as of 2026:
-    # microsoft/harrier-oss-v1-0.6b (MIT, 94 languages incl. Hindi, 1024 dims,
-    # 32K context, MTEB Multilingual v2 69.0 at 0.6B params). Alternatives:
-    #   Qwen/Qwen3-Embedding-0.6B | google/embeddinggemma-300m
-    #   microsoft/harrier-oss-v1-270m (4x faster on CPU: ~1.7 chunks/s vs ~0.4)
-    EMBEDDING_LOCAL_MODEL: str = os.getenv("EMBEDDING_LOCAL_MODEL", "microsoft/harrier-oss-v1-0.6b")
+    # is not an API model or no API key is available. The 2026 default is
+    # microsoft/harrier-oss-v1-270m: MIT license, 94 languages, 640 dims,
+    # MTEB Multilingual v2 ~66.5 - chosen for CPU Spaces measured ~4x faster
+    # than the 0.6b sibling (~1.7 vs ~0.4 chunks/s, and 640 vs 512-dim storage).
+    EMBEDDING_LOCAL_MODEL: str = os.getenv("EMBEDDING_LOCAL_MODEL", "microsoft/harrier-oss-v1-270m")
     # Prompt name applied to query-side embeddings for prompt-trained models.
     # harrier requires "web_search_query" for queries (documents are encoded plain).
     # Qwen3 uses "query". Set empty to disable.
