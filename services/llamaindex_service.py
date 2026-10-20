@@ -26,7 +26,8 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 import config
 from services.document_store_service import DocumentStoreService
 from services.mcp_pii import AGENTIC_PII_NAMESPACE
-from services.embedding_service import _QUOTA_MARKERS
+from services import llm_providers
+from services.llm_providers import permanent_llm_error as _permanent_openai_error
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +64,8 @@ class _OpenAICompat(OpenAI):
             return tiktoken.get_encoding("o200k_base")
 
 
-def _permanent_openai_error(exc: Exception) -> bool:
-    """True for quoting/auth OpenAI failures that will never succeed on retry."""
-    status = str(getattr(exc, "status_code", "") or "")
-    if status in ("401", "403", "429"):
-        return True
-    text = str(exc)
-    return any(marker in text for marker in _QUOTA_MARKERS)
+# _permanent_openai_error now lives in services/llm_providers (shared with
+# the REST chain) and is imported as permanent_llm_error above.
 
 
 class AgenticQueryError(RuntimeError):
@@ -98,24 +94,25 @@ class LlamaIndexService:
         self._try_load_from_storage()
 
     def _initialize_settings(self):
-        """Initialize LlamaIndex settings (LLM, Embeddings)"""
+        """Initialize LlamaIndex settings (LLM, Embeddings)."""
         try:
-            # LLM Setup
-            if self.config.OPENAI_API_KEY:
-                # gpt-5.1-chat-latest etc. are not in llama_index's baked-in
-                # registry - _OpenAICompat skips that broken validation.
-                Settings.llm = _OpenAICompat(model=self.config.OPENAI_MODEL, api_key=self.config.OPENAI_API_KEY)
-                logger.info(f"LlamaIndex using OpenAI model: {self.config.OPENAI_MODEL}")
-            elif self.config.NEBIUS_API_KEY:
-                # Use Nebius as OpenAI-compatible provider (registry bypassed)
-                Settings.llm = _OpenAICompat(
-                    model=self.config.NEBIUS_MODEL,
-                    api_key=self.config.NEBIUS_API_KEY,
-                    api_base=self.config.NEBIUS_BASE_URL
-                )
-                logger.info(f"LlamaIndex using Nebius model: {self.config.NEBIUS_MODEL}")
+            # LLM Setup - one shared provider chain (free tiers first):
+            # Gemini -> Groq -> OpenRouter -> Nebius -> OpenAI. All legs are
+            # OpenAI-compatible, so the same _OpenAICompat wrapper (which
+            # bypasses llama_index's stale model-name registry) covers all.
+            leg = llm_providers.pick_llm_provider(self.config)
+            if leg:
+                kwargs = {"model": leg["model"], "api_key": leg["api_key"]}
+                if leg["name"] != "openai":
+                    kwargs["api_base"] = leg["base_url"]
+                Settings.llm = _OpenAICompat(max_retries=1, **kwargs)
+                logger.info("LlamaIndex using %s model: %s", leg["name"], leg["model"])
             else:
-                logger.warning("No API key found for LlamaIndex LLM (OpenAI or Nebius). Agentic features may fail.")
+                logger.warning(
+                    "No LLM API key found (GEMINI_API_KEY / GROQ_API_KEY / "
+                    "OPENROUTER_API_KEY / NEBIUS_API_KEY / OPENAI_API_KEY). "
+                    "Agentic features may fail."
+                )
 
             # Embedding Setup
             if self.config.EMBEDDING_MODEL.startswith("text-embedding-"):

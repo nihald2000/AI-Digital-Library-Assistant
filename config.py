@@ -36,6 +36,30 @@ class Config:
     NEBIUS_BASE_URL: str = os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.com/v1/")
     NEBIUS_MODEL: str = os.getenv("NEBIUS_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
 
+    # Free-tier LLM provider chain (all OpenAI-compatible REST endpoints).
+    # First leg with a usable key serves requests; a leg that fails with a
+    # permanent error (quota/auth) is skipped automatically for the session.
+    # Default order per user choice: Gemini first, Groq backup, OpenRouter
+    # for model comparison, then the paid/legacy legs (Nebius, OpenAI).
+    LLM_PROVIDER_CHAIN: str = os.getenv("LLM_PROVIDER_CHAIN", "gemini,groq,openrouter,nebius,openai,mistral")
+    GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
+    GEMINI_BASE_URL: str = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")          # free tier
+    GEMINI_FAST_MODEL: str = os.getenv("GEMINI_FAST_MODEL", "gemini-2.5-flash-lite")
+
+    GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
+    GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+    # Groq free tier after 2026-08-16: Llama chat models are enterprise-only;
+    # the free-tier chat models are the GPT-OSS/Qwen open-weight set.
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    GROQ_FAST_MODEL: str = os.getenv("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
+
+    OPENROUTER_API_KEY: Optional[str] = os.getenv("OPENROUTER_API_KEY")
+    OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    # ":free" suffix routes to OpenRouter's rotating free-model pool.
+    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b:free")
+    OPENROUTER_FAST_MODEL: str = os.getenv("OPENROUTER_FAST_MODEL", "openai/gpt-oss-20b:free")
+
     # Model Configuration
     # Using OpenAI managed embeddings for performance/quality
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
@@ -55,8 +79,10 @@ class Config:
     EMBEDDING_QUERY_PROMPT: str = os.getenv("EMBEDDING_QUERY_PROMPT", "web_search_query")
 
     MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "mistral-large-2407")
-    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-5.1-chat-latest")
-    FAST_MODEL: str = os.getenv("FAST_MODEL", "gpt-5-mini")
+    # gpt-5.1-chat-latest was deprecated on OpenAI (observed 2026-10-20);
+    # these remain valid served models, override via env if needed.
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    FAST_MODEL: str = os.getenv("FAST_MODEL", "gpt-4.1-nano")
 
     # Storage Configuration
     DATA_DIR: str = os.getenv("DATA_DIR", "./data")

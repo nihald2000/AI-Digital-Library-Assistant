@@ -5,21 +5,25 @@ from typing import List, Dict, Any, Optional
 
 import openai
 import config
+from services import llm_providers
 
 logger = logging.getLogger(__name__)
 
 class LLMService:
     def __init__(self):
         self.config = config.config
-        
+
         self.nebius_client = None
-        self.mistral_client = None 
+        self.mistral_client = None
         self.openai_client = None
-        
+
+        # legs whose key/config failed PERMANENTLY this session (quota/auth)
+        self._disabled: Dict[str, str] = {}
+
         self._initialize_clients()
-    
+
     def _initialize_clients(self):
-        """Initialize LLM clients"""
+        """Initialize legacy SDK clients (chain legs build their own lazily)."""
         try:
             if self.config.OPENAI_API_KEY:
                 self.openai_client = openai.OpenAI(
@@ -33,79 +37,150 @@ class LLMService:
                     base_url=self.config.NEBIUS_BASE_URL
                 )
                 logger.info("NEBIUS client initialized")
-            
+
             if self.config.MISTRAL_API_KEY:
                 self.mistral_client = Mistral( # Standard sync client
                     api_key=self.config.MISTRAL_API_KEY
                 )
                 logger.info("Mistral client initialized")
-            
-            # Check if at least one client is initialized
-            if not any([self.openai_client, self.nebius_client, self.mistral_client]):
-                logger.warning("No LLM clients could be initialized based on current config. Check API keys.")
+
+            chain = llm_providers.resolve_llm_providers(self.config)
+            if chain:
+                logger.info("LLM provider chain (%d legs): %s",
+                            len(chain), " -> ".join(l["name"] for l in chain))
             else:
-                logger.info("LLM clients initialized successfully (at least one).")
-                
+                logger.warning("No LLM provider chain legs resolved. Check API keys (GEMINI_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY / NEBIUS_API_KEY).")
+
         except Exception as e:
             logger.error(f"Error initializing LLM clients: {str(e)}")
             raise
-    
+
+    # ------------------------------------------------------------ chain core
+    def _chain_legs(self) -> List[Dict[str, str]]:
+        """Usable chain legs (permanently-failed legs filtered out)."""
+        return [
+            leg for leg in llm_providers.resolve_llm_providers(self.config)
+            if leg["name"] not in self._disabled
+        ]
+
+    def _client_for(self, leg: Dict[str, str]):
+        """Lazily built OpenAI-compat client per leg (max_retries=1: failover beats long retry loops)."""
+        cache = getattr(self, "_compat_clients", None)
+        if cache is None:
+            cache = self._compat_clients = {}
+        key = (leg["name"], leg["base_url"], leg["api_key"])
+        if key not in cache:
+            cache[key] = openai.OpenAI(
+                api_key=leg["api_key"],
+                base_url=leg["base_url"],
+                max_retries=1,
+            )
+        return cache[key]
+
+    async def _generate_compat(self, leg: Dict[str, str], prompt: str,
+                               model_name: str, max_tokens: int, temperature: float) -> str:
+        """One chat-completions call against an OpenAI-compatible leg."""
+        client = self._client_for(leg)
+        logger.debug("Generating via %s model=%s max_tokens=%s temp=%s",
+                     leg["name"], model_name, max_tokens, temperature)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        )
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            return response.choices[0].message.content.strip()
+        return ""
+
+    def _disable_leg(self, name: str, exc: Exception) -> None:
+        if name not in self._disabled:
+            self._disabled[name] = str(exc)[:200]
+            logger.warning("LLM leg '%s' disabled for this session: %s", name, self._disabled[name])
+
+    async def _generate_on_leg(self, leg: Dict[str, str], prompt: str,
+                               model_name: str, max_tokens: int, temperature: float) -> str:
+        if leg["kind"] == "sdk-mistral":
+            return await self._generate_with_mistral(prompt, model_name, max_tokens, temperature)
+        return await self._generate_compat(leg, prompt, model_name, max_tokens, temperature)
+
     async def generate_text(self, prompt: str, model: str = "auto", max_tokens: int = 1000, temperature: float = 0.7) -> str:
-        """Generate text using the specified model, with new priority for 'auto'."""
-        try:
-            selected_model_name_for_call: str = "" 
+        """Generate text through the provider chain.
 
-            if model == "auto":
-                # Priority: 1. NEBIUS (Llama 3.3 - Cost Effective), 2. OpenAI (GPT-5.1), 3. Mistral
-                if self.nebius_client and self.config.NEBIUS_MODEL:
-                    selected_model_name_for_call = self.config.NEBIUS_MODEL
-                    logger.debug(f"Auto-selected NEBIUS model: {selected_model_name_for_call}")
-                    return await self._generate_with_nebius(prompt, selected_model_name_for_call, max_tokens, temperature)
-                elif self.openai_client and self.config.OPENAI_MODEL:
-                    selected_model_name_for_call = self.config.OPENAI_MODEL
-                    logger.debug(f"Auto-selected OpenAI model: {selected_model_name_for_call}")
-                    return await self._generate_with_openai(prompt, selected_model_name_for_call, max_tokens, temperature)
-                elif self.mistral_client and self.config.MISTRAL_MODEL:
-                    selected_model_name_for_call = self.config.MISTRAL_MODEL
-                    logger.debug(f"Auto-selected Mistral model: {selected_model_name_for_call}")
-                    return await self._generate_with_mistral(prompt, selected_model_name_for_call, max_tokens, temperature)
-                else:
-                    logger.error("No LLM clients available for 'auto' mode or default models not configured.")
-                    raise ValueError("No LLM clients available for 'auto' mode or default models not configured.")
-            
-            elif model == "fast":
-                 # Priority for speed: 1. OpenAI (GPT-5-mini), 2. Mistral Small, 3. Nebius
-                if self.openai_client and self.config.FAST_MODEL:
-                    return await self._generate_with_openai(prompt, self.config.FAST_MODEL, max_tokens, temperature)
-                # Fallback to auto if fast model not available
-                return await self.generate_text(prompt, "auto", max_tokens, temperature)
+        model='auto'   -> first healthy leg's primary model
+        model='fast'   -> first healthy leg's fast model
+        explicit model -> routed to the owning leg ('groq/...', 'gemini/...',
+                          'openrouter/...', 'nebius/...', 'gpt-*', 'mistral*')
 
-            elif model.startswith("gpt-") or model.startswith("openai/") or "o1-" in model or "o3-" in model:
-                if self.openai_client:
-                     actual_model = model.split('/')[-1] if '/' in model else model
-                     return await self._generate_with_openai(prompt, actual_model, max_tokens, temperature)
-                elif self.nebius_client and "gpt-oss" in model: # Handle Nebius "openai/" prefix if any
-                     actual_model = model.split('/')[-1] if '/' in model else model
-                     return await self._generate_with_nebius(prompt, actual_model, max_tokens, temperature)
-                else:
-                     raise ValueError("OpenAI client not available. Check API key.")
-            
-            elif model.lower().startswith("nebius/") or model.lower().startswith("meta-llama/"):
-                if not self.nebius_client:
-                    raise ValueError("NEBIUS client not available. Check API key.")
-                return await self._generate_with_nebius(prompt, model, max_tokens, temperature)
+        A leg that fails with a PERMANENT error (401/402/403/429, quota text)
+        is dropped for the session and the next leg serves immediately;
+        transient errors also fall through to the next leg, and the last
+        exception re-raises if every leg fails.
+        """
+        errors: List[str] = []
 
-            elif model.startswith("mistral"):
-                if not self.mistral_client:
-                    raise ValueError("Mistral client not available. Check API key or model prefix.")
-                return await self._generate_with_mistral(prompt, model, max_tokens, temperature)
-            
+        # ---- explicit model routing
+        if model not in ("auto", "fast"):
+            leg_name = llm_providers.leg_for_model(model)
+            if leg_name:
+                for leg in self._chain_legs():
+                    if leg["name"] != leg_name:
+                        continue
+                    stripped = model
+                    for prefix in llm_providers.PROVIDER_PREFIXES.get(leg_name, ()):
+                        if stripped.lower().startswith(prefix):
+                            stripped = stripped[len(prefix):]
+                            break
+                    stripped = stripped or leg["model"]
+                    try:
+                        return await self._generate_on_leg(leg, prompt, stripped, max_tokens, temperature)
+                    except Exception as exc:
+                        errors.append(f"{leg['name']}: {exc}")
+                        if llm_providers.permanent_llm_error(exc):
+                            self._disable_leg(leg["name"], exc)
+                        break  # explicit leg owns this model; then fail over below
+                # fall through to chain for resilience if the owned leg failed
             else:
-                raise ValueError(f"Unsupported model: {model}. Must start with 'gpt-', 'openai/', 'nebius/', 'mistral', or be 'auto'.")
-        
-        except Exception as e:
-            logger.error(f"Error generating text with model '{model}': {str(e)}")
-            raise
+                return await self._generate_with_fallback_chain(
+                    prompt, self.config.OPENAI_MODEL, max_tokens, temperature, errors
+                )
+
+        # ---- chain walk
+        legs = self._chain_legs()
+        if not legs:
+            raise ValueError(
+                "No LLM provider available. Add a free key (GEMINI_API_KEY, "
+                f"GROQ_API_KEY or OPENROUTER_API_KEY). Attempts: {errors}"
+            )
+        key = "fast_model" if model == "fast" else "model"
+        for leg in legs:
+            model_name = leg.get(key) or leg["model"]
+            try:
+                return await self._generate_on_leg(leg, prompt, model_name, max_tokens, temperature)
+            except Exception as exc:
+                errors.append(f"{leg['name']}: {exc}")
+                logger.warning("LLM leg '%s' failed (%s) - trying next provider",
+                               leg["name"], str(exc)[:120])
+                if llm_providers.permanent_llm_error(exc):
+                    self._disable_leg(leg["name"], exc)
+        raise ValueError(f"All LLM providers failed. {'; '.join(e[:150] for e in errors)}")
+
+    async def _generate_with_fallback_chain(self, prompt: str, fallback_model: str,
+                                            max_tokens: int, temperature: float,
+                                            errors: List[str]) -> str:
+        """Legacy single-model choice routed through the chain (explicit unknown model)."""
+        for leg in self._chain_legs():
+            try:
+                return await self._generate_on_leg(leg, prompt, fallback_model, max_tokens, temperature)
+            except Exception as exc:
+                errors.append(f"{leg['name']}: {exc}")
+                if llm_providers.permanent_llm_error(exc):
+                    self._disable_leg(leg["name"], exc)
+        raise ValueError(f"All LLM providers failed. {'; '.join(e[:150] for e in errors)}")
 
     async def _generate_with_openai(self, prompt: str, model_name: str, max_tokens: int, temperature: float) -> str:
         """Generate text using OpenAI"""
@@ -188,7 +263,7 @@ class LLMService:
             
             response = await loop.run_in_executor(
                 None,
-                lambda: self.mistral_client.chat(
+                lambda: self.mistral_client.chat.complete(
                     model=model_name, 
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=max_tokens, 
@@ -377,44 +452,28 @@ Answer:"""
             return {"error": f"General error extracting key information: {str(e)}"}
 
     async def check_availability(self) -> Dict[str, bool]:
-        """Check which LLM services are available by making a tiny test call."""
-        availability = {
-            "openai": False,
-            "nebius": False,
-            "mistral": False
-        }
+        """Check each chain leg with a tiny test call."""
+        availability: Dict[str, bool] = {}
         test_prompt = "Hello"
         test_max_tokens = 5
         test_temp = 0.1
 
-        logger.info("Checking LLM availability...")
+        logger.info("Checking LLM chain availability...")
+        for leg in llm_providers.resolve_llm_providers(self.config):
+            name = leg["name"]
+            if name in self._disabled:
+                availability[name] = False
+                continue
+            try:
+                logger.debug(f"Testing '{name}' with model {leg['model']}...")
+                test_response = await self._generate_on_leg(
+                    leg, test_prompt, leg["model"], test_max_tokens, test_temp
+                )
+                availability[name] = bool(test_response.strip())
+            except Exception as e:
+                availability[name] = False
+                logger.warning(f"LLM leg '{name}' availability check failed: {e}")
+            logger.info(f"LLM leg '{name}' available: {availability[name]}")
 
-        if self.openai_client and self.config.OPENAI_MODEL:
-            try:
-                logger.debug(f"Testing OpenAI availability with model {self.config.OPENAI_MODEL}...")
-                test_response = await self._generate_with_openai(test_prompt, self.config.OPENAI_MODEL, test_max_tokens, test_temp)
-                availability["openai"] = bool(test_response.strip())
-            except Exception as e:
-                logger.warning(f"OpenAI availability check failed for model {self.config.OPENAI_MODEL}: {e}")
-        logger.info(f"OpenAI available: {availability['openai']}")
-
-        if self.nebius_client and self.config.NEBIUS_MODEL:
-            try:
-                logger.debug(f"Testing NEBIUS availability with model {self.config.NEBIUS_MODEL}...")
-                test_response = await self._generate_with_nebius(test_prompt, self.config.NEBIUS_MODEL, test_max_tokens, test_temp)
-                availability["nebius"] = bool(test_response.strip())
-            except Exception as e:
-                logger.warning(f"NEBIUS availability check failed for model {self.config.NEBIUS_MODEL}: {e}")
-        logger.info(f"NEBIUS available: {availability['nebius']}")
-        
-        if self.mistral_client and self.config.MISTRAL_MODEL:
-            try:
-                logger.debug(f"Testing Mistral availability with model {self.config.MISTRAL_MODEL}...")
-                test_response = await self._generate_with_mistral(test_prompt, self.config.MISTRAL_MODEL, test_max_tokens, test_temp)
-                availability["mistral"] = bool(test_response.strip())
-            except Exception as e:
-                logger.warning(f"Mistral availability check failed for model {self.config.MISTRAL_MODEL}: {e}")
-        logger.info(f"Mistral available: {availability['mistral']}")
-        
         logger.info(f"Final LLM Availability: {availability}")
         return availability

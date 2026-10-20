@@ -243,7 +243,32 @@ survival layers now exist:
   context stays undetected to avoid false positives; checksum-validated matches always outrank the fallback.
   Detection remains best effort - no completeness or compliance claim is made.
 - **We make no claim of completeness or regulatory compliance** — detection is best-effort; validate before
-  regulated use. The voice/LlamaIndex agentic path is not masked today (see `mcp_tools/voice_tool.py`).
+  regulated use. The voice QA / podcast agentic pipeline masks index content and analysis prompts into the
+  `agentic-kb` namespace and unmaps user-facing answers/transcripts at delivery (`services/mcp_pii.py`).
+
+### LLM provider chain (free tiers first, no paid credits needed)
+Nebius budget ran out - requests no longer die with 402. `services/llm_providers.py` resolves
+`LLM_PROVIDER_CHAIN` (default `gemini,groq,openrouter,nebius,openai,mistral`) into the configured legs:
+
+| Leg | Free-tier model (default) | Base URL |
+|-----|---------------------------|----------|
+| `gemini`  (primary) | `gemini-2.5-flash` / fast `gemini-2.5-flash-lite` | `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| `groq` (backup)     | `openai/gpt-oss-120b` / fast `openai/gpt-oss-20b` (Llama chat IDs left Groq's free tier 2026-08-16) | `https://api.groq.com/openai/v1` |
+| `openrouter` (compare models) | any `:free` model id, e.g. `openai/gpt-oss-120b:free` | `https://openrouter.ai/api/v1` |
+| `nebius`, `openai`, `mistral` | paid / legacy legs kept last | - |
+
+Behaviour (both `services/llm_service.py` and the LlamaIndex agent share this resolver):
+- The first leg with an API key serves every `model="auto"/"fast"` request; each leg owns a *fast* variant
+  for tags/categorization.
+- A leg answering a PERMANENT error (401/402/403/429, `credit_balance_exhausted`...) is dropped **for the
+  session** and the next leg serves immediately (clients use `max_retries=1` so failover is fast).
+- Explicit model strings route to their owning leg: `gemini/gemini-2.5-pro`, `groq/openai/gpt-oss-120b`,
+  `openrouter/<model>:free`, `nebius/meta-llama/...`, `gpt-*`, `mistral*`.
+- LlamaIndex uses the same first leg through `_OpenAICompat` (bypasses llama_index's stale OpenAI model-name
+  registry "Unknown model" bug and skips tiktoken for foreign names).
+- Setup: free keys, no credit card - `GEMINI_API_KEY` (aistudio.google.com), `GROQ_API_KEY`
+  (console.groq.com), `OPENROUTER_API_KEY` (openrouter.ai). Add only the ones you want; missing keys drop
+  out of the chain.
 
 ### Ingestion queue (worker split)
 - Bulk ingests enqueue into `ingest_jobs` (SQLite); a dedicated worker thread drains them, so parsing/OCR
