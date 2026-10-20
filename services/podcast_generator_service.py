@@ -181,20 +181,23 @@ Generate the complete casual podcast script now:"""
         self,
         llamaindex_service: LlamaIndexService,
         llm_service: LLMService,
-        elevenlabs_api_key: Optional[str] = None
+        elevenlabs_api_key: Optional[str] = None,
+        pii_service: Any = None
     ):
         """
         Initialize podcast generator service
-        
+
         Args:
-            llamaindex_service: Service for document analysis
+            llamaindex_service: Service for document analysis (fallback path)
             llm_service: Service for script generation
             elevenlabs_api_key: ElevenLabs API key (uses config if not provided)
+            pii_service: PII boundary - analysis inputs are masked, deliverables restored
         """
         self.config = config.config
         self.llamaindex_service = llamaindex_service
         self.llm_service = llm_service
-        
+        self.pii_service = pii_service
+
         # Initialize ElevenLabs client
         self.elevenlabs_client = None
         if ELEVENLABS_AVAILABLE:
@@ -205,11 +208,12 @@ Generate the complete casual podcast script now:"""
                     logger.info("ElevenLabs client initialized for podcast generation")
                 except Exception as e:
                     logger.error(f"Failed to initialize ElevenLabs client: {e}")
-        
-        # Create podcast storage directory
-        self.podcast_dir = Path("./data/podcasts")
+
+        # Create podcast storage directory (NO ./data hardcode: on HF Spaces
+        # Persistent Storage the tree lives under /data; keep them identical)
+        self.podcast_dir = Path(self.config.DATA_DIR) / "podcasts"
         self.podcast_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Metadata database file
         self.metadata_file = self.podcast_dir / "metadata_db.json"
         self._ensure_metadata_db()
@@ -266,15 +270,18 @@ Generate the complete casual podcast script now:"""
             
             # Calculate generation time
             generation_time = (datetime.now() - start_time).total_seconds()
-            
+
             # Step 4: Create metadata
-            logger.info("Step 4: Creating metadata...")
+            # Voices kept as an ORDERED dict - the old `set` collapsed equal
+            # names and re-ordered host1/host2 nondeterministically, so saved
+            # metadata could swap the voices entirely.
+            voices = {"host1": host1_voice, "host2": host2_voice}
             metadata = self._create_metadata(
                 podcast_id,
                 analysis,
                 script,
                 audio_file_path,
-                {host1_voice, host2_voice},
+                voices,
                 document_ids,
                 style
             )
@@ -282,16 +289,17 @@ Generate the complete casual podcast script now:"""
             # Save metadata
             self._save_metadata(metadata)
             
-            # Save transcript
+            # Save transcript (user-facing view: placeholders unmasked)
+            transcript_text = self._restore_for_user(script.to_text())
             transcript_path = self.podcast_dir / f"{podcast_id}_transcript.txt"
-            transcript_path.write_text(script.to_text(), encoding="utf-8")
-            
+            transcript_path.write_text(transcript_text, encoding="utf-8")
+
             logger.info(f"Podcast generated successfully: {podcast_id}")
-            
+
             return PodcastResult(
                 podcast_id=podcast_id,
                 audio_file_path=str(audio_file_path),
-                transcript=script.to_text(),
+                transcript=transcript_text,
                 metadata=metadata,
                 generation_time=generation_time,
                 success=True
@@ -310,43 +318,124 @@ Generate the complete casual podcast script now:"""
             )
     
     async def analyze_documents(self, document_ids: List[str]) -> DocumentAnalysis:
-        """
-        Analyze documents to extract key insights for podcast
-        
-        Args:
-            document_ids: List of document IDs
-        
-        Returns:
-            DocumentAnalysis with key insights and topics
-        """
-        # Create analysis query for the agentic RAG
-        analysis_query = f"""Analyze the following documents and provide:
-1. The 5-7 most important insights or key points
-2. Main themes and topics covered
-3. The overall complexity level (beginner/intermediate/advanced)
-4. A brief summary suitable for podcast discussion
+        """Analyze documents to extract key insights for the podcast.
 
-Document IDs: {', '.join(document_ids)}
+        Reads the actual stored content directly (bounded) - the old path fed
+        the agentic agent a list of *document IDs it has no way to filter on*,
+        so the agent answered from whatever retrieval pulled and could go
+        hallucinating against the wrong docs.
+        """
+        MAX_DOCS = 8
+        MAX_CHARS_PER_DOC = 8_000
+        MAX_TOTAL_CHARS = 40_000
 
-Provide a structured analysis optimized for creating an engaging podcast discussion."""
-        
-        # Use LlamaIndex agentic RAG for analysis
-        result = await self.llamaindex_service.query(analysis_query)
-        
-        # Parse the result to extract structured information
-        # This is a simplified parser - in production, you might want more robust parsing
-        insights = self._extract_insights(result)
-        topics = self._extract_topics(result)
-        complexity = self._determine_complexity(result)
-        
+        snippets: List[str] = []
+        loaded_ids: List[str] = []
+        total_chars = 0
+        for doc_id in document_ids[:MAX_DOCS]:
+            try:
+                doc = await self._load_doc_info(doc_id)
+                content = (doc or {}).get("content") or ""
+                if not content:
+                    continue
+                take = min(len(content), MAX_CHARS_PER_DOC, max(0, MAX_TOTAL_CHARS - total_chars))
+                if take <= 0:
+                    break
+                total_chars += take
+                loaded_ids.append(doc_id)
+                name = doc.get("filename") or doc_id[:8]
+                snippets.append(f"=== DOCUMENT {name} ===\n{content[:take]}")
+            except Exception as exc:
+                logger.warning("Could not load document %s for podcast: %s", doc_id[:8], exc)
+
+        if not snippets:
+            # Fallback to the agentic agent when direct loads fail entirely -
+            # and fail LOUDLY on a broken pipeline (no garbage podcasts).
+            result = await self.llamaindex_service.query_strict(
+                "Summarize the library's most substantial documents: 5-7 key "
+                "insights, main themes, complexity level, and a brief summary."
+            )
+            return self._analysis_from_text(result, document_ids[:MAX_DOCS])
+
+        combined = "\n\n".join(snippets)
+        # PII boundary: analysis prompt content is masked; real values are
+        # restored in the transcript/audio at delivery time.
+        masked_combined = self._mask_for_pipeline(combined)
+        analysis_text = await self.llm_service.generate_text(
+            "You are preparing material for a podcast. From the following"
+            " library documents, provide:\n"
+            "1. The 5-7 most important insights (numbered list)\n"
+            "2. Main themes and topics\n"
+            "3. Overall complexity (beginner/intermediate/advanced)\n"
+            "4. A brief summary suitable for podcast discussion\n\n"
+            f"{masked_combined}",
+            max_tokens=1200,
+        )
+        return self._analysis_from_text(analysis_text, loaded_ids or document_ids[:MAX_DOCS])
+
+    async def _load_doc_info(self, doc_id: str) -> Dict[str, Any]:
+        """Fetch {filename, content} for a document via the shared doc store."""
+        store = self.llamaindex_service.document_store
+        info: Dict[str, Any] = {}
+        fetch = getattr(store, "get_document", None)
+        if fetch:
+            doc = await fetch(doc_id)
+            info = doc.to_dict() if doc and hasattr(doc, "to_dict") else {}
+            info.setdefault("filename", getattr(doc, "filename", None))
+        loader = getattr(store, "load_content", None)
+        if loader:
+            info["content"] = await loader(doc_id) or ""
+        return info
+
+    def _analysis_from_text(self, text: str, doc_ids: List[str]) -> DocumentAnalysis:
+        insights = self._extract_insights(text)
+        topics = self._extract_topics(text)
+        complexity = self._determine_complexity(text)
         return DocumentAnalysis(
             key_insights=insights[:7],  # Limit to 7
             topics=topics,
             complexity_level=complexity,
-            estimated_words=len(result.split()),
-            source_documents=document_ids,
-            summary=result
+            estimated_words=len((text or "").split()),
+            source_documents=doc_ids,
+            summary=text or "",
         )
+
+    def _mask_for_pipeline(self, text: str) -> str:
+        """Mask sensitive values before they reach any LLM in this pipeline."""
+        if not text or not self.pii_service:
+            return text
+        try:
+            from services.mcp_pii import AGENTIC_PII_NAMESPACE
+
+            return self.pii_service.mask_for_agent(text, namespace=AGENTIC_PII_NAMESPACE).masked_text
+        except Exception as exc:
+            logger.warning("Podcast PII masking failed (failing closed): %s", exc)
+            return self._strip_likely_pii(text)
+
+    def _restore_for_user(self, text: str) -> str:
+        """Unmask placeholders in a user-facing deliverable (transcript/audio)."""
+        if not text or not self.pii_service:
+            return text
+        try:
+            from services.mcp_pii import AGENTIC_PII_NAMESPACE
+
+            return self.pii_service.restore_for_user(text, AGENTIC_PII_NAMESPACE)
+        except Exception:
+            return text
+
+    def _strip_likely_pii(self, text: str) -> str:
+        """Emergency scrub when masking is impossible (never best-effort leak)."""
+        patterns = [
+            r"[\w.+-]+@[\w-]+\.[\w.-]+",          # emails
+            r"(?:\+\d{1,3}[\s-]?)?\d{10}",         # 10-digit phones
+            r"\b[A-Z]{5}\d{4}[A-Z]\b",             # PAN
+            r"\b\d{4}\s?\d{4}\s?\d{4}\b",          # Aadhaar-shaped
+            r"\b(?:\d[ -]*?){13,19}\b",            # card-shaped
+        ]
+        scrubbed = text
+        for pattern in patterns:
+            scrubbed = re.sub(pattern, "[REDACTED]", scrubbed)
+        return scrubbed
     
     def _extract_insights(self, text: str) -> List[str]:
         """Extract key insights from analysis text"""
@@ -460,67 +549,92 @@ SUMMARY:
         )
     
     def _parse_script(self, script_text: str) -> List[DialogueLine]:
-        """Parse generated script into dialogue lines"""
-        dialogue = []
-        lines = script_text.split('\n')
-        
-        for line in lines:
-            line = line.strip()
+        """Parse generated script into dialogue lines.
+
+        LLMs print the speaker in all sorts of shapes: `HOST1:`, `**HOST1:**`,
+        `Host 1:`, `1. HOST1:` - if the parser missed those, the podcast had
+        ZERO dialogue lines and the audio ended up empty. Tolerant regex +
+        markdown emphasis stripping fix that.
+        """
+        dialogue: List[DialogueLine] = []
+        header = re.compile(
+            r"^(?:\d+[\).]\s*)?\**\s*HOST\s*[- ]?\s*([12])\*?\s*:\s*(.*)$",
+            re.IGNORECASE,
+        )
+        current: Optional[DialogueLine] = None
+        for raw in (script_text or "").split("\n"):
+            line = raw.strip()
             if not line:
                 continue
-            
-            # Match "HOST1:" or "HOST2:" format
-            if line.startswith('HOST1:'):
-                text = line[6:].strip()
+            match = header.match(line)
+            if match:
+                speaker = f"HOST{match.group(1)}"
+                text = match.group(2).strip()
+                text = re.sub(r"\*+", "", text).strip()  # markdown emphasis
+                current = DialogueLine(speaker=speaker, text=text) if text else None
+                if current:
+                    dialogue.append(current)
+            elif current:
+                # continuation of the previous host's line
+                text = re.sub(r"\*+", "", line).strip()
                 if text:
-                    dialogue.append(DialogueLine(speaker="HOST1", text=text))
-            elif line.startswith('HOST2:'):
-                text = line[6:].strip()
-                if text:
-                    dialogue.append(DialogueLine(speaker="HOST2", text=text))
-        
+                    current.text = (current.text + " " + text).strip()
         return dialogue
     
-    def _get_voice_id(self, voice_name: str) -> str:
+    def _get_voice_id(self, voice_name: str) -> Optional[str]:
         """
         Get voice ID from voice name.
         Falls back to first available voice if not found.
-        
+
         Args:
             voice_name: Voice name (e.g., "Rachel", "Adam")
-        
+
         Returns:
-            Voice ID string
+            Voice ID string, or None when no voices are reachable.
         """
         try:
             # Try to get voices and find by name
             voices = self.elevenlabs_client.voices.get_all()
-            
+
             if not voices or not voices.voices:
                 logger.error("No voices available from ElevenLabs")
-                raise RuntimeError("No voices available")
-            
+                return None
+
             # First, try exact name match
             for voice in voices.voices:
                 if voice.name.lower() == voice_name.lower():
                     logger.info(f"Found exact voice match for '{voice_name}': {voice.voice_id}")
                     return voice.voice_id
-            
+
             # Try partial match
             for voice in voices.voices:
                 if voice_name.lower() in voice.name.lower():
                     logger.info(f"Found partial voice match for '{voice_name}': {voice.name} ({voice.voice_id})")
                     return voice.voice_id
-            
+
             # Use first available voice as fallback
             first_voice = voices.voices[0]
             logger.warning(f"Voice '{voice_name}' not found, using first available voice: {first_voice.name} ({first_voice.voice_id})")
             return first_voice.voice_id
-            
+
         except Exception as e:
             logger.error(f"Could not fetch voices: {e}", exc_info=True)
-            raise RuntimeError(f"Failed to get voice ID: {str(e)}")
-    
+            return None
+
+    # ------------------------------------------------------------ TTS (sync)
+    def _tts_line_sync(self, voice_id: str, text: str) -> bytes:
+        """Blocking ElevenLabs call for one dialogue line -> raw mp3 bytes."""
+        audio_generator = self.elevenlabs_client.text_to_speech.convert(
+            voice_id=voice_id,
+            text=text,
+            model_id="eleven_multilingual_v2",
+        )
+        return b"".join(chunk for chunk in audio_generator if chunk)
+
+    async def _voice_id_async(self, host_voice: str) -> Optional[str]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._get_voice_id, host_voice)
+
     async def synthesize_audio(
         self,
         podcast_id: str,
@@ -528,60 +642,54 @@ SUMMARY:
         host1_voice: str,
         host2_voice: str
     ) -> Path:
-        """
-        Synthesize audio from script using ElevenLabs
-        
-        Args:
-            podcast_id: Unique podcast ID
-            script: Podcast script
-            host1_voice: Voice for HOST1
-            host2_voice: Voice for HOST2
-        
-        Returns:
-            Path to generated MP3 file
+        """Synthesize audio with each host in its OWN voice.
+
+        The old one-shot version fed `HOST1:/HOST2: ...` labels into a single
+        voice for the whole show (nobody could tell the hosts apart).
+        Per-line synthesis with per-host voice id, plus mp3 concatenation of
+        frame-aligned streams; every blocking network call runs in an
+        executor so the shared event loop never stalls.
         """
         if not self.elevenlabs_client:
             raise RuntimeError("ElevenLabs client not initialized")
-        
+
         audio_file = self.podcast_dir / f"{podcast_id}.mp3"
-        
-        # For now, create a simple text-to-speech for the full script
-        # In production, you'd combine segments with pauses
-        full_text = script.to_text()
-        
-        # Get actual voice ID
-        voice_id = self._get_voice_id(host1_voice)
-        
-        try:
-            # Use modern ElevenLabs TTS API
-            # Note: This is a simplified version using single voice
-            # Full implementation would process each line separately with different voices
-            
-            logger.info(f"Generating audio with voice: {host1_voice}")
-            
-            # Use the modern text_to_speech API
-            audio_generator = self.elevenlabs_client.text_to_speech.convert(
-                voice_id=voice_id,  # Using resolved voice ID
-                text=full_text,
-                model_id="eleven_multilingual_v2"
-            )
-            
-            # Write audio chunks to file
-            with open(audio_file, 'wb') as f:
-                for chunk in audio_generator:
-                    if chunk:
-                        f.write(chunk)
-            
-            # Verify file was created with content
-            if audio_file.exists() and audio_file.stat().st_size > 1000:
-                logger.info(f"Audio synthesized successfully: {audio_file} ({audio_file.stat().st_size} bytes)")
-                return audio_file
-            else:
-                raise RuntimeError(f"Generated audio file is too small or empty: {audio_file.stat().st_size} bytes")
-            
-        except Exception as e:
-            logger.error(f"Audio synthesis failed: {e}", exc_info=True)
-            raise RuntimeError(f"Failed to generate podcast audio: {str(e)}")
+        loop = asyncio.get_running_loop()
+
+        # Deliverables never speak placeholders aloud: unmask before TTS.
+        lines = [
+            (line.speaker, self._restore_for_user(line.text))
+            for line in script.dialogue
+        ]
+        if not lines:
+            raise RuntimeError("Podcast script has no dialogue lines to synthesize")
+
+        voice_ids: Dict[str, Optional[str]] = {
+            "HOST1": await self._voice_id_async(host1_voice),
+            "HOST2": await self._voice_id_async(host2_voice),
+        }
+        if not voice_ids.get("HOST1"):
+            raise RuntimeError("Could not resolve any ElevenLabs voice for HOST1")
+
+        logger.info("Synthesizing %d lines (voices: host1=%s, host2=%s)",
+                    len(lines), voice_ids["HOST1"][:8], voice_ids.get("HOST2", "?")[:8])
+
+        segments: List[bytes] = []
+        for i, (speaker, text) in enumerate(lines, 1):
+            speaker_voice = voice_ids.get(speaker) or voice_ids["HOST1"]
+            logger.info("TTS %s/%s %s (%d chars)", i, len(lines), speaker, len(text))
+            segments.append(await loop.run_in_executor(
+                None, lambda sv=speaker_voice, t=text: self._tts_line_sync(sv, t)
+            ))
+
+        # mp3 frames are self-contained; straight concatenation yields a
+        # decodable stream (natural pause comes from the host turnaround).
+        audio_file.write_bytes(b"".join(segments))
+
+        if audio_file.exists() and audio_file.stat().st_size > 1000:
+            logger.info(f"Audio synthesized successfully: {audio_file} ({audio_file.stat().st_size} bytes)")
+            return audio_file
+        raise RuntimeError(f"Generated audio file is too small or empty: {audio_file.stat().st_size} bytes")
     
     def _create_metadata(
         self,
@@ -589,24 +697,24 @@ SUMMARY:
         analysis: DocumentAnalysis,
         script: PodcastScript,
         audio_path: Path,
-        voices: set,
+        voices: Dict[str, str],
         document_ids: List[str],
         style: str
     ) -> PodcastMetadata:
         """Create podcast metadata"""
         # Auto-generate title
         title = f"Podcast: {analysis.topics[0] if analysis.topics else 'Document Discussion'}"
-        
+
         # Create description
         description = f"A {style} podcast discussing insights from {len(document_ids)} document(s)."
-        
+
         # Calculate file size
-        file_size_mb = audio_path.stat().st_size / (1024 * 1024) if audio_path.exists() else 0
-        
+        file_size_mb = audio_path.stat().st_size / (1024 * 1024) if audio_path and Path(str(audio_path)).exists() else 0
+
         # Estimate costs
         llm_cost = (script.word_count / 1000) * 0.01  # Rough estimate
         tts_cost = (script.word_count * 5 / 1000) * 0.30  # Rough estimate
-        
+
         return PodcastMetadata(
             podcast_id=podcast_id,
             title=title,
@@ -615,8 +723,7 @@ SUMMARY:
             style=style,
             duration_seconds=script.total_duration_estimate,
             file_size_mb=file_size_mb,
-            voices={"host1": list(voices)[0] if len(voices) > 0 else "Rachel", 
-                   "host2": list(voices)[1] if len(voices) > 1 else "Adam"},
+            voices=dict(voices),
             generated_at=datetime.now().isoformat(),
             generation_cost={"llm_cost": llm_cost, "tts_cost": tts_cost, "total": llm_cost + tts_cost},
             key_topics=analysis.topics

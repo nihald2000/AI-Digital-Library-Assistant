@@ -105,6 +105,15 @@ class EmbeddingService:
         else:
             self._load_local_model(self.model_name)
 
+    @property
+    def openai_embeddings_active(self) -> bool:
+        """Runtime truth about the OpenAI embeddings leg.
+
+        False once the leg was permanently disabled after quota/auth failures
+        (also False whenever the config resolves to a local model).
+        """
+        return self._is_openai_model
+
     def _disable_openai_leg(self, exc: Exception) -> None:
         """Permanent OpenAI failure (quota/auth): local model takes over now."""
         self._is_openai_model = False

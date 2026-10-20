@@ -865,26 +865,28 @@ voice_conversation_state = {
 }
 
 def start_voice_conversation():
-    """Start a new voice conversation session"""
+    """Start a new voice conversation session (text Q&A always works; ElevenLabs is additive)."""
     try:
-        if not mcp_server.elevenlabs_service.is_available():
-            return (
-                "⚠️ Voice assistant not configured. Please set ELEVENLABS_API_KEY and ELEVENLABS_AGENT_ID in .env",
-                gr.update(interactive=False),
-                gr.update(interactive=True),
-                ""
-            )
-        
-        session_id = str(uuid.uuid4())
-        result = mcp_server.run_async(mcp_server.elevenlabs_service.start_conversation(session_id))
-        
+        if mcp_server.elevenlabs_service.is_available():
+            session_id = str(uuid.uuid4())
+            result = mcp_server.run_async(mcp_server.elevenlabs_service.start_conversation(session_id))
+        else:
+            # Text-only Q&A needs no ElevenLabs keys at all
+            session_id = str(uuid.uuid4())
+            result = {"success": True, "text_only": True}
+
         if result.get("success"):
             voice_conversation_state["session_id"] = session_id
             voice_conversation_state["active"] = True
             voice_conversation_state["transcript"] = []
-            
+
+            intro = (
+                "🎙️ Voice assistant is ready. Type your question below."
+                if not result.get("text_only")
+                else "💬 QA session ready (text mode - add ELEVENLABS_API_KEY for real-time audio). Type your question below."
+            )
             return (
-                "🎙️ Voice assistant is ready. Type your question below.",
+                intro,
                 gr.update(interactive=False),
                 gr.update(interactive=True),
                 []
@@ -1091,7 +1093,10 @@ def load_dashboard_stats():
         # Service status indicators
         vector_stat = "✅ Online" if getattr(mcp_server, "vector_store", None) else "❌ Offline"
         llm_stat = "✅ Ready" if getattr(mcp_server, "llm_service", None) else "❌ Offline"
-        voice_stat = "✅ Ready" if (getattr(mcp_server, "elevenlabs_service", None) and mcp_server.elevenlabs_service.is_available()) else "⚠️ Configure API Key"
+        voice_stat = (
+            "✅ Voice+Text Ready" if (getattr(mcp_server, "elevenlabs_service", None) and mcp_server.elevenlabs_service.is_available())
+            else "💬 Text Mode Ready"
+        )
         
         return (
             doc_count,

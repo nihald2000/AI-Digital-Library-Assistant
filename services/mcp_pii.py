@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # PIIService (_prune_mappings, PII_MAPPING_TTL_SECONDS).
 MCP_PII_NAMESPACE = "mcp-knowledge-base"
 
+# Namespace for the agentic (LlamaIndex) pipeline shared by the voice QA tool
+# and podcast generation: index/analysis content is masked into this namespace
+# and every user-facing deliverable (answer, transcript) is restored from it.
+AGENTIC_PII_NAMESPACE = "agentic-kb"
+
 
 def mask_for_mcp(text: str, pii_service: Any, register: bool = True) -> Tuple[str, int]:
     """Mask raw text at the MCP boundary. Returns (masked_text, finding_count).

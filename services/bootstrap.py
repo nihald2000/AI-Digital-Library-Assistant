@@ -74,12 +74,17 @@ class AppServices:
         self.ingest_queue = IngestionQueueService(
             ingestion_tool=self.ingestion_tool, store=self.store
         )
-        self.llamaindex_service = LlamaIndexService(self.document_store)
+        self.llamaindex_service = LlamaIndexService(
+            self.document_store,
+            pii_service=self.pii_service,
+            embedding_service=self.embedding_service,
+        )
 
         self.elevenlabs_service = ElevenLabsService(self.llamaindex_service)
         self.podcast_generator = PodcastGeneratorService(
             llamaindex_service=self.llamaindex_service,
             llm_service=self.llm_service,
+            pii_service=self.pii_service,
         )
 
         self.search_tool = SearchTool(
@@ -94,7 +99,7 @@ class AppServices:
             search_tool=self.search_tool,
             pii_service=self.pii_service,
         )
-        self.voice_tool = VoiceTool(self.elevenlabs_service)
+        self.voice_tool = VoiceTool(self.elevenlabs_service, self.llamaindex_service, self.pii_service)
         self.podcast_tool = PodcastTool(self.podcast_generator)
 
         self._maintenance_task: Optional[asyncio.Task] = None
@@ -107,6 +112,9 @@ class AppServices:
         await self.pii_service.initialize()
         if config.config.INGEST_QUEUE_ENABLED:
             await self.ingest_queue.initialize()
+        if config.config.LLAMAINDEX_ENABLED:
+            # build the agentic index (voice QA / podcast) from current library
+            await self.llamaindex_service.initialize()
         logger.info("AppServices ready")
 
     async def start_maintenance(self) -> None:
@@ -148,6 +156,12 @@ class AppServices:
                             logger.info("Persistence: %s", flushed)
                     except Exception as exc:
                         logger.warning("Backup flush error: %s", exc)
+                    # keep the agentic index in step with the library
+                    try:
+                        if config.config.LLAMAINDEX_ENABLED:
+                            await self.llamaindex_service.sync_if_stale()
+                    except Exception as exc:
+                        logger.warning("Agentic sync error: %s", exc)
             except asyncio.CancelledError:
                 for task in worker_tasks:
                     task.cancel()

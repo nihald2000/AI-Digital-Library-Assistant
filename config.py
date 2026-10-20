@@ -124,6 +124,9 @@ class Config:
     ELEVENLABS_API_KEY: Optional[str] = os.getenv("ELEVENLABS_API_KEY")
     ELEVENLABS_AGENT_ID: Optional[str] = os.getenv("ELEVENLABS_AGENT_ID")
     ELEVENLABS_VOICE_MODEL: str = os.getenv("ELEVENLABS_VOICE_MODEL", "Rachel")
+    # Cap for RAG lookups inside ElevenLabs conversational tools (was a missing
+    # attribute before - the voice RAG tool crashed with AttributeError).
+    CONVERSATION_TIMEOUT: float = _float("CONVERSATION_TIMEOUT", 30.0)
 
     # ---- LlamaIndex (agentic RAG) guardrails ----
     # The agentic service builds a second in-RAM index. It must stay capped

@@ -58,15 +58,22 @@ class PodcastTool:
             )
             
             if result.success:
+                # metadata could be malformed/None even on success - never
+                # crash AFTER generation succeeded
+                metadata = asdict(result.metadata) if result.metadata else {}
+                duration = metadata.get("duration_seconds")
+                message = (
+                    f"Podcast generated successfully! Duration: {duration / 60:.1f} minutes"
+                    if duration else "Podcast generated successfully!"
+                )
                 return {
                     "success": True,
                     "podcast_id": result.podcast_id,
                     "audio_file": result.audio_file_path,
-                    "audio_url": f"/data/podcasts/{result.podcast_id}.mp3",
                     "transcript": result.transcript,
-                    "metadata": asdict(result.metadata) if result.metadata else {},
+                    "metadata": metadata,
                     "generation_time": result.generation_time,
-                    "message": f"Podcast generated successfully! Duration: {result.metadata.duration_seconds/60:.1f} minutes"
+                    "message": message,
                 }
             else:
                 return {
