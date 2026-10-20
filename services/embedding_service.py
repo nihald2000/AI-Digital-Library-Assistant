@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
@@ -29,6 +30,32 @@ logger = logging.getLogger(__name__)
 _OPENAI_TRUNCATABLE = ("text-embedding-3-small", "text-embedding-3-large")
 
 _QUOTA_MARKERS = ("insufficient_quota", "credit_balance_exhausted", "credit_balance", "insufficient_user_quota")
+
+# ZeroGPU Spaces (Nvidia RTX Pro 6000 Blackwell etc.): CUDA lives behind the
+# `spaces` runtime and only @spaces.GPU-decorated calls get an allocation.
+# Anywhere else this is a clean no-op, so the CPU path stays the default.
+try:
+    import spaces as _hf_spaces  # type: ignore
+except Exception:  # pragma: no cover
+    _hf_spaces = None
+ZEROGPU_ENABLED = os.getenv("SPACES_ZERO_GPU", "").lower() in ("1", "true") and _hf_spaces is not None
+
+
+def _encode_batch(model: Any, texts: Sequence[str], kwargs: Dict[str, Any]) -> "np.ndarray":
+    """Bare encode step, safe to wrap with @spaces.GPU (module top-level fn)."""
+    import torch
+
+    if "cuda" not in model.device.type:
+        model.to("cuda")
+    result = model.encode(list(texts), convert_to_numpy=True, normalize_embeddings=True, **kwargs)
+    torch.cuda.synchronize()
+    return result
+
+
+if ZEROGPU_ENABLED and _hf_spaces is not None:
+    # 60s covers hundreds of chunks per batch on Blackwell; Free-tier ZeroGPU
+    # may clamp guest durations anyway.
+    _encode_batch = _hf_spaces.GPU(duration=60)(_encode_batch)
 
 
 class OpenAIEmbeddingsUnavailable(RuntimeError):
@@ -351,19 +378,34 @@ class EmbeddingService:
             encode_kwargs: Dict[str, Any] = {}
             if prompt_name:
                 encode_kwargs["prompt_name"] = prompt_name
-            embeddings = await loop.run_in_executor(
-                None,
-                lambda: self._model.encode(
-                    batch_texts,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                    batch_size=len(batch_texts),
-                    **encode_kwargs,
-                ),
-            )
+            encode_kwargs["batch_size"] = len(batch_texts)
+            embeddings = await self._encode_with_fallback(batch_texts, encode_kwargs)
             for i, embedding in zip(batch_indices, np.asarray(embeddings)):
                 out[i] = embedding.astype("float32").tolist()
         return out
+
+    async def _encode_with_fallback(self, batch_texts: List[str], encode_kwargs: Dict[str, Any]):
+        """ZeroGPU-aware encode: GPU call, graceful CPU fallback.
+
+        Queue workers run outside the Gradio request context, where ZeroGPU
+        may refuse an allocation - fall back to CPU so ingestion never dies.
+        """
+        if ZEROGPU_ENABLED and _hf_spaces is not None:
+            try:
+                return _encode_batch(self._model, batch_texts, encode_kwargs)
+            except Exception as exc:
+                logger.warning("ZeroGPU encode unavailable (%s: %.200s) - falling back to CPU for this batch",
+                               exc.__class__.__name__, str(exc))
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._model.encode(
+                batch_texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                **encode_kwargs,
+            ),
+        )
 
     def _model_dims(self) -> int:
         return self.dimensions or self._model.get_sentence_embedding_dimension()

@@ -1,3 +1,10 @@
+# On ZeroGPU Spaces, `spaces` must be imported BEFORE torch/transformers so it
+# can route CUDA initialization. Harmless no-op elsewhere (pip ships it).
+try:
+    import spaces  # noqa: F401
+except Exception:  # pragma: no cover
+    spaces = None
+
 import gradio as gr
 import os
 import asyncio

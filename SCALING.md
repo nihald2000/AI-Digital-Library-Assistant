@@ -179,11 +179,15 @@ What this stack delivers, honestly:
 | One A100/H100-worker subprocess running the 0.6b/270m in fp16 | ~50-150 | days; combined with the API leg for mixed workloads |
 | Distributed cluster (8+ GPUs / many API workers) | thousands | ~1-3 h |
 
-Levers already wired: multi-file upload (all files enqueue at once), the
-persistent queue (crash-safe resume + job progress), `EMBEDDING_CONCURRENCY`
-+ `EMBEDDING_BATCH_SIZE` for the API leg, and `INGEST_QUEUE_MAX_CONCURRENT_JOBS`.
-The realistic 2026 path to very-large libraries: ingest continuously with the
-queue (API leg when credits exist), or attach a GPU runner for the local model.
+### ZeroGPU (Nvidia RTX Pro 6000 Blackwell) Spaces
+The embedding service detects `SPACES_ZERO_GPU` and routes every local encode
+through a `@spaces.GPU`-decorated function (60s/call cap, hundreds of chunks
+fit easily on Blackwell). Gradio request-context calls (search, DoChat) run on
+the GPU; background queue workers may be refused an allocation outside a
+request context and automatically fall back to CPU (logged once per batch).
+Union throughput: interactive paths massively faster; upload ingestion stays
+CPU-bound unless run via request-context, so large libraries still want the
+API leg or a persistent GPU tier.
 
 ### PII boundary (agent never sees raw sensitive data)
 - Detection runs at every LLM boundary (`GenerativeTool.answer_question`, `summarize`): question + retrieval
