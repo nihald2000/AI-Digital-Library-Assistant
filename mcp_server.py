@@ -25,6 +25,16 @@ mcp = FastMCP("")
 logger.info("FastMCP server initialized.")
 
 
+# --------------------------------------------------------------------------
+# PII protocol for external MCP clients (Claude Desktop, ChatGPT, ...)
+# See services/mcp_pii.py for the full contract: retrieval outputs are masked
+# to [TYPE_N] placeholders (stable per value, TTL-bound, memory-only), and
+# pii_restore_placeholders unmask the agent's final user-facing reply.
+# --------------------------------------------------------------------------
+from services.mcp_pii import MCP_PII_NAMESPACE as _MCP_PII_NS
+from services.mcp_pii import mask_for_mcp, masked_source_dicts  # noqa: E402
+
+
 @mcp.tool()
 async def ingest_document(file_path: str, file_type: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -158,6 +168,36 @@ async def scan_pii(text: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+async def pii_restore_placeholders(text: str) -> Dict[str, Any]:
+    """
+    Replace [TYPE_N]-style PII placeholders with the real values stored
+    in-memory from recent masked tool results, then return the text ready
+    for the end user.
+
+    Call this on your FINAL user-facing reply (after composing it with the
+    placeholders you received). Placeholders expire after one hour and never
+    touch disk. If nothing resolves, pass the text through unchanged.
+    """
+    try:
+        import re as _re
+        raw = text or ""
+        restored = services.pii_service.restore_for_user(raw, _MCP_PII_NS)
+        placeholders = _re.findall(r"\[(?:[A-Z_]+)_\d+\]", raw)
+        # a placeholder is resolved when it no longer appears in the output
+        unresolved = sum(1 for token in set(placeholders) if token in restored)
+        return {
+            "success": True,
+            "text": restored,
+            "placeholders_seen": len(set(placeholders)),
+            "unresolved": unresolved,
+            "changed": restored != raw,
+        }
+    except Exception as e:
+        logger.error(f"Error in 'pii_restore_placeholders' tool: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e), "text": text}
+
+
+@mcp.tool()
 async def pii_add_custom_rule(
     name: str, rule: str, rule_type: str = "keyword", tag: str = "KEYWORD"
 ) -> Dict[str, Any]:
@@ -219,16 +259,25 @@ async def ingest_text(content: str, filename: str = "text_content.txt") -> Dict[
 async def semantic_search(query: str, top_k: int = 5, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Hybrid search (dense FAISS + BM25 sparse, Reciprocal Rank Fusion) through
-    indexed content. 'filters' can narrow the search (document_id, doc_type).
+    the indexed knowledge base. 'filters' can narrow the search (document_id,
+    doc_type).
+
+    PII protocol: returned snippets have sensitive values rewritten to
+    [TYPE_N] placeholders. Use the placeholders as-is when composing answers
+    and call pii_restore_placeholders on the final user-facing reply.
     """
     logger.info(f"Tool 'semantic_search' called with query: {query}, top_k: {top_k}, filters: {filters}")
     try:
         results = await services.search_tool.search(query, top_k, filters)
+        masked_results, findings = masked_source_dicts(results, services.pii_service)
+        if findings:
+            logger.info("MCP boundary: masked %s PII finding(s) in search output", findings)
         return {
             "success": True,
             "query": query,
-            "results": [result.to_dict() for result in results],
+            "results": masked_results,
             "total_results": len(results),
+            "pii_placeholders": findings,
         }
     except Exception as e:
         logger.error(f"Error in 'semantic_search' tool: {str(e)}", exc_info=True)
@@ -291,7 +340,9 @@ async def generate_tags(
                 return {"success": False, "error": f"Document {document_id} not found"}
         if not text_for_tags:
             return {"success": False, "error": "No content provided for tag generation"}
-        tags = await services.generative_tool.generate_tags(text_for_tags, max_tags)
+        # the LLM only ever sees a masked view of the content
+        masked_for_tags, _ = mask_for_mcp(text_for_tags, services.pii_service)
+        tags = await services.generative_tool.generate_tags(masked_for_tags, max_tags)
         if document_id and tags:
             await document_store_service.update_document_metadata(document_id, {"tags": tags})
             logger.info(f"Tags {tags} saved for document {document_id}")
@@ -309,8 +360,14 @@ async def generate_tags(
 @mcp.tool()
 async def answer_question(question: str, context_filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Answer questions using hybrid RAG (Retrieval Augmented Generation) over
-    indexed content. 'context_filter' can narrow down the context search.
+    Answer questions using hybrid RAG over the knowledge base.
+    'context_filter' can narrow the context search (document_id, doc_type).
+
+    PII protocol (end-to-end): the question and retrieval context are masked
+    to [TYPE_N] placeholders before the LLM sees them, generation happens in
+    this process, and real values are restored in the returned answer. Sources
+    are returned masked - use pii_restore_placeholders on any text you show
+    the user if you compose your own reply.
     """
     logger.info(f"Tool 'answer_question' called with question: {question}, context_filter: {context_filter}")
     try:
@@ -323,11 +380,15 @@ async def answer_question(question: str, context_filter: Optional[Dict[str, Any]
                 "answer": "I could not find enough information in the documents to answer your question."
             }
         answer = await services.generative_tool.answer_question(question, search_results)
+        masked_sources, findings = masked_source_dicts(search_results, services.pii_service)
+        if findings:
+            logger.info("MCP boundary: masked %s PII finding(s) in source list", findings)
         return {
             "success": True,
             "question": question,
             "answer": answer,
-            "sources": [result.to_dict() for result in search_results],
+            "sources": masked_sources,
+            "pii_placeholders": findings,
             "confidence": "high" if len(search_results) >= 3 else "medium"
         }
     except Exception as e:

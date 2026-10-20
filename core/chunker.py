@@ -284,12 +284,20 @@ class TextChunker:
         return f"{document_id}_chunk_{chunk_index}"
     
     def optimize_chunks_for_embedding(self, chunks: List[Chunk]) -> List[Chunk]:
-        """Optimize chunks for better embedding generation"""
+        """Whitespace-normalize chunks WITHOUT mangling them.
+
+        The old behavior ran an "aggressive" regex clean that stripped ``@``
+        and ``+`` - silently corrupting emails, phone country codes, passport
+        and checksum-bearing identifiers in stored text. Modern open-weight
+        embedding models (harrier, Qwen3, e5) are trained on natural text and
+        score *better* on raw content. Only whitespace is collapsed here;
+        every character class survives, which also lets the PII boundary see
+        intact values it must mask.
+        """
         optimized_chunks = []
-        
+
         for chunk in chunks:
-            # Clean the content for embedding
-            clean_content = self.preprocessor.prepare_for_embedding(chunk.content)
+            clean_content = re.sub(r"\s+", " ", chunk.content).strip()
             
             # Skip very short chunks
             if len(clean_content.split()) < 5:
