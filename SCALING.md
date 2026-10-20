@@ -129,6 +129,10 @@ Notes:
 | `INGEST_QUEUE_ENABLED` | true | Persistent background worker queue for bulk ingests |
 | `INGEST_QUEUE_POLL_SECONDS` | 1.0 | Worker poll interval for pending jobs |
 | `INGEST_QUEUE_MAX_CONCURRENT_JOBS` | 1 | Jobs processed simultaneously by the worker (bump to 2-3 on larger CPUs; embeddings are CPU-bound so gains come from API-legs, not worker count) |
+| `PERSIST_BACKUP_ENABLED` | true | Snapshot the data tree to a private HF dataset repo on changes |
+| `PERSIST_BACKUP_REPO` | — | `<owner>/<repo>` of the private dataset repo holding snapshots (needs `HF_TOKEN` Space secret) |
+| `PERSIST_BACKUP_INTERVAL_SECONDS` | 120 | Debounce between snapshot uploads; a flush fires whenever `library.db` changed |
+| `PERSIST_BACKUP_MAX_FILE_MB` | 200 | Files larger than this (podcast audio) are excluded from snapshots |
 | `PII_MASKING_ENABLED` | true | Master switch: mask PII before the LLM sees it |
 | `PII_IN_ENABLED` | true | India entities (Aadhaar, PAN, GSTIN, IFSC, phone, passport) |
 | `PII_US_ENABLED` | true | US entities (SSN, ITIN, phone, ZIP, routing, DL) |
@@ -188,6 +192,40 @@ request context and automatically fall back to CPU (logged once per batch).
 Union throughput: interactive paths massively faster; upload ingestion stays
 CPU-bound unless run via request-context, so large libraries still want the
 API leg or a persistent GPU tier.
+
+"With GPU - is 100+ docs in 1 minute possible now?" Only in part: the GPU
+accelerates the *embedding* step. Parsing/OCR/chunking of 100 PDFs is CPU work
+on the Space's 2 vCPUs and easily dominates for scanned documents. Honest
+expectations for ~100 typical short PDFs (~3k chunks):
+
+| Stage | Time on this Space |
+|---|---|
+| Parse + chunk (2 vCPU, queue worker) | minutes, batch-dependent |
+| Embed 3k chunks @ GPU (request paths, when allocation granted) | seconds |
+| Embed 3k chunks @ CPU fallback (background queue) | ~30 min (270m) |
+| Vector persist to disk | instant, forced after each ingest flow |
+
+So: search/DoChat re-embedding becomes near-instant on ZeroGPU; full upload
+ingestion lands in minutes, not one minute, until either GPU allocations are
+granted to background jobs or an API/dedicated-GPU tier takes over the queue.
+CPU parse/OCR physics - not feature flags - is where the remaining time goes.
+
+### Persistence across Space restarts
+HF Space containers are wiped on every restart/rebuild (code push, upgrade) -
+the library (db, FAISS index, BM25, uploads) used to reset to empty. Two
+survival layers now exist:
+
+1. **Persistent Storage** (paid Space add-on): a blank volume mounts at
+   `/data`; `config.py` auto-detects it and relocates `DATA_DIR`/`DB_PATH`
+   there - zero further setup.
+2. **Free snapshot fallback** (`services/backup_service.py`): add two Space
+   secrets - `HF_TOKEN` (write token) and `PERSIST_BACKUP_REPO=<owner>/<repo>`
+   (the dataset repo is auto-created *private*). On boot the snapshot is
+   restored when the local data dir is empty; the maintenance loop then
+   uploads a fresh tar.gz (WAL-checkpointed SQLite + FAISS + BM25 + uploads)
+   whenever `library.db` changes, debounced to 2 min. Restore never clobbers
+   newer local data (fires only into an empty dir), extraction rejects path
+   traversal, and podcast-audio blobs above 200 MB stay out of snapshots.
 
 ### PII boundary (agent never sees raw sensitive data)
 - Detection runs at every LLM boundary (`GenerativeTool.answer_question`, `summarize`): question + retrieval

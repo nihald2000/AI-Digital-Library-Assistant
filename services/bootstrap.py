@@ -20,6 +20,7 @@ from services.bm25_service import BM25Service
 from services.hybrid_search_service import HybridSearchService
 from services.pii_service import PIIService
 from services.ingestion_queue_service import IngestionQueueService
+from services.backup_service import BackupService
 from services.llamaindex_service import LlamaIndexService
 from services.elevenlabs_service import ElevenLabsService
 from services.podcast_generator_service import PodcastGeneratorService
@@ -39,6 +40,15 @@ class AppServices:
 
     def __init__(self):
         cfg = config.config
+        # Persistence first: on a fresh Space container, rehydrate the data
+        # dir from the private dataset-repo snapshot BEFORE any store opens
+        # its files (never fails the boot if the network/repo misbehaves).
+        self.backup = BackupService()
+        try:
+            self.backup.restore()
+        except Exception as exc:
+            logger.warning("Snapshot restore failed (booting anyway): %s", exc)
+
         self.store: SQLiteStore = SQLiteStore(cfg.DB_PATH)
         self.vector_store = VectorStoreService(store=self.store)
         self.document_store = DocumentStoreService(store=self.store)
@@ -130,6 +140,14 @@ class AppServices:
                             logger.info("BM25 maintenance: %s", rebuild_info)
                     except Exception as exc:
                         logger.exception("Maintenance loop error: %s", exc)
+                    # debounced persistence: upload a snapshot whenever the
+                    # library db changed (ingests, deletes, PII rules, ...)
+                    try:
+                        flushed = await self.backup.flush_if_due()
+                        if flushed:
+                            logger.info("Persistence: %s", flushed)
+                    except Exception as exc:
+                        logger.warning("Backup flush error: %s", exc)
             except asyncio.CancelledError:
                 for task in worker_tasks:
                     task.cancel()

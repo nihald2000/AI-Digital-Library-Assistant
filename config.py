@@ -139,6 +139,20 @@ class Config:
     INGEST_QUEUE_POLL_SECONDS: float = _float("INGEST_QUEUE_POLL_SECONDS", 1.0)
     INGEST_QUEUE_MAX_CONCURRENT_JOBS: int = _int("INGEST_QUEUE_MAX_CONCURRENT_JOBS", 1)
 
+    # ---- Persistence across Space restarts ----
+    # HF Space containers are wiped on every restart/upgrade. Survive it in one
+    # of two ways: (a) attach Persistent Storage (auto-detected at /data), or
+    # (b) free fallback: snapshots of the whole data tree pushed to a private
+    # HF dataset repo (restore on boot, debounced flush after ingests).
+    # (b) needs two Space secrets: HF_TOKEN (write access) and
+    # PERSIST_BACKUP_REPO=<owner>/<repo>.
+    PERSIST_BACKUP_ENABLED: bool = _bool("PERSIST_BACKUP_ENABLED", True)
+    PERSIST_BACKUP_REPO: Optional[str] = os.getenv("PERSIST_BACKUP_REPO") or None
+    # Minimum seconds between snapshot uploads (debounce + repo rate limits).
+    PERSIST_BACKUP_INTERVAL_SECONDS: float = _float("PERSIST_BACKUP_INTERVAL_SECONDS", 120.0)
+    # Files larger than this (e.g. podcast audio blobs) are skipped in snapshots.
+    PERSIST_BACKUP_MAX_FILE_MB: int = _int("PERSIST_BACKUP_MAX_FILE_MB", 200)
+
     # ---- PII protection knobs ----
     PII_MASKING_ENABLED: bool = _bool("PII_MASKING_ENABLED", True)
     PII_IN_ENABLED: bool = _bool("PII_IN_ENABLED", True)    # India entities
@@ -158,4 +172,31 @@ class Config:
     PORT: int = _int("PORT", 7860)
     DEBUG: bool = _bool("DEBUG", False)
 
+def _maybe_redirect_to_persistent_disk(cfg: "Config") -> None:
+    """HF Spaces Persistent Storage (~$5/mo add-on) mounts a blank volume at /data.
+
+    When it exists we keep every artifact there instead of the evanescent
+    container filesystem - the library then survives restarts with zero code
+    changes. Explicit env overrides always win.
+    """
+    if os.getenv("DATA_DIR"):
+        return
+    try:
+        from pathlib import Path
+
+        mount = Path("/data")
+        if mount.is_dir() and os.access(mount, os.W_OK):
+            cfg.DATA_DIR = "/data"
+            os.environ.setdefault("DATA_DIR", "/data")
+            if not os.getenv("DOCUMENT_STORE_PATH"):
+                cfg.DOCUMENT_STORE_PATH = "/data/documents"
+            if not os.getenv("DB_PATH"):
+                cfg.DB_PATH = "/data/library.db"
+            logger_print = print  # config.py loads before logging is up
+            logger_print("Persistent-storage mount /data detected - library state now survives restarts")
+    except Exception:
+        pass
+
+
 config = Config()
+_maybe_redirect_to_persistent_disk(config)
