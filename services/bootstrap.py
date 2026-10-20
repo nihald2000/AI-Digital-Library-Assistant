@@ -111,12 +111,15 @@ class AppServices:
 
         async def _loop():
             interval = 15
-            worker_tasks: list = []
             if config.config.INGEST_QUEUE_ENABLED:
                 await self.ingest_queue.initialize()
-                worker_tasks.append(asyncio.create_task(
-                    self.ingest_queue.run_worker_loop(), name="ingest-queue-worker"
-                ))
+                await self.ingest_queue.recover_stale_running()
+                # register on the service so get_stats().worker_alive is truthful
+                self.ingest_queue._workers = [
+                    asyncio.create_task(
+                        self.ingest_queue.run_worker_loop(), name="ingest-queue-worker"
+                    )
+                ]
                 logger.info("Ingestion queue worker enabled")
             try:
                 while True:

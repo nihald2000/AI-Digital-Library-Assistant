@@ -121,6 +121,38 @@ def test_directory_job_end_to_end(env):
     asyncio.run(flow())
 
 
+def test_stale_running_jobs_requeued_on_boot(env):
+    """A crash mid-job leaves status='running'; worker boot must requeue them."""
+    async def flow():
+        store, doc_store, queue, cfg = _build(env)
+        await store.initialize()
+        await queue.initialize()
+
+        target = _seed_directory(workdir := env, count=1)
+        result = await queue.enqueue("directory", target)
+        job_id = result["job_id"]
+
+        # simulate the crash: job claimed (running), then the process died
+        claimed = await queue.claim_next()
+        assert claimed["status"] == "running"
+
+        requeued = await queue.recover_stale_running()
+        assert requeued == 1
+        job = await queue.get_job(job_id)
+        assert job["status"] == "pending"
+
+        # idempotent: a second sweep with no running rows is a no-op
+        assert await queue.recover_stale_running() == 0
+
+        # and the recovered job completes normally
+        claimed_again = await queue.claim_next()
+        await queue.process_claimed(claimed_again)
+        finished = await queue.get_job(job_id)
+        assert finished["status"] == "done"
+
+    asyncio.run(flow())
+
+
 def test_failed_job_records_error(env):
     async def flow():
         store, doc_store, queue, cfg = _build(env)

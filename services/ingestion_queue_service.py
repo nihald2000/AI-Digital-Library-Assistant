@@ -69,6 +69,32 @@ class IngestionQueueService:
                 )
         await asyncio.get_running_loop().run_in_executor(None, _ddl)
 
+    async def recover_stale_running(self) -> int:
+        """Crash-recovery: requeue any 'running' job at worker boot.
+
+        Called exactly once per process, before any worker exists, so every
+        row in 'running' state belongs to a dead process (the queue is durable
+        SQLite, but the old docstring promised restart-safety it never had).
+        """
+        def _requeue():
+            conn = self.store._connect()
+            with conn:
+                conn.execute(
+                    "UPDATE ingest_jobs SET status='pending', started_at=NULL"
+                    " WHERE status='running'"
+                )
+                return conn.execute(
+                    "SELECT changes()"
+                ).fetchone()[0]
+        try:
+            requeued = await asyncio.get_running_loop().run_in_executor(None, _requeue)
+            if requeued:
+                logger.info("Requeued %s stale 'running' ingestion job(s) from a previous run", requeued)
+            return requeued
+        except Exception as exc:
+            logger.warning("Stale-running recovery skipped: %s", exc)
+            return 0
+
     # ------------------------------------------------------------- enqueue
     async def enqueue(
         self, job_type: str, target: str,

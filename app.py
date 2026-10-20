@@ -421,34 +421,45 @@ def refresh_library():
     return doc_list_refreshed, doc_choices_refreshed
 
 def upload_and_process_file(file):
-    """Queue an uploaded file for background ingestion; returns immediately.
+    """Queue one or many uploaded files for background ingestion; returns fast.
 
-    Local (Space CPU) embedding at ~0.4-2 chunks/s means a 60-chunk PDF used to
-    block the browser for minutes; the persistent queue owns that latency now.
+    Accepts a single filepath (legacy) or a list from gr.File(multiple).
+    CPU-slow work (OCR, parsing, local embeddings) must never block the
+    browser - the persistent ingestion queue owns the throughput.
     """
     if file is None:
         return ("No file uploaded", "", get_document_list(), get_document_choices())
+    files = file if isinstance(file, (list, tuple)) else [file]
+    accepted, failed = [], []
     try:
-        file_path = file.name if hasattr(file, "name") else str(file)
-        logger.info(f"Processing file: {file_path}")
-
-        # gradio temp files can be cleaned up after the request - archive the
-        # upload into our own folder before handing the path to the worker.
         upload_dir = Path(config.config.DOCUMENT_STORE_PATH) / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        target = upload_dir / f"{stamp}_{Path(file_path).name}"
-        shutil.copy2(file_path, target)
-
-        result = mcp_server.run_async(mcp_server.enqueue_document_async(str(target)))
-        if result.get("success"):
-            job_id = (result.get("job_id") or "")[:12]
-            status = (
-                f"✅ Uploaded: queued as background job {job_id}…\n"
-                "The ⏳ Ingestion Queue tab shows progress; the document appears in the library when the worker finishes."
-            )
+        job_ids = []
+        for single in files:
+            try:
+                file_path = single.name if hasattr(single, "name") else str(single)
+                target = upload_dir / f"{stamp}_{Path(file_path).name}"
+                shutil.copy2(file_path, target)
+                result = mcp_server.run_async(mcp_server.enqueue_document_async(str(target)))
+                if result.get("success"):
+                    job_ids.append((Path(file_path).name, (result.get("job_id") or "")[:8]))
+                    accepted.append(Path(file_path).name)
+                else:
+                    failed.append(f"{Path(file_path).name}: {result.get('error')}")
+            except Exception as inner:
+                name = single.name if hasattr(single, "name") else str(single)
+                failed.append(f"{Path(name).name}: {inner}")
+        if job_ids:
+            status = (f"✅ Uploaded {len(job_ids)} file(s) → {len(job_ids)} background job(s):\n"
+                      + "\n".join(f"• {name} — job {jid}…" for name, jid in job_ids[:12])
+                      + (f"\n…and {len(job_ids) - 12} more" if len(job_ids) > 12 else "")
+                      + "\n\nThe ⏳ Ingestion Queue tab tracks progress; documents appear in the library as the worker finishes.\n"
+                      "💡 Tip: run 🔄 Refresh Library after the queue drains.")
         else:
-            status = f"❌ Queue error: {result.get('error', 'unknown error')}"
+            status = "❌ No files queued: " + "; ".join(failed) if failed else "❌ No files queued."
+        if failed and job_ids:
+            status += "\n⚠️ Not queued: " + "; ".join(failed)
         return (status, "", get_document_list(), get_document_choices())
     except Exception as e:
         logger.error(f"Error queueing upload: {str(e)}")
@@ -1186,15 +1197,15 @@ def create_gradio_interface():
                 with gr.Row():
                     with gr.Column():
                         with gr.Group():
-                            gr.Markdown("**Supported formats:** PDF, DOCX, TXT, Images (JPG, PNG)")
+                            gr.Markdown("**Supported formats:** PDF, DOCX, TXT, Images (JPG, PNG) — select **multiple files at once**, they queue automatically.")
                             file_input_upload = gr.File(
-                                label="Select File",
+                                label="Select File(s)",
                                 file_types=[".pdf", ".txt", ".docx", ".png", ".jpg", ".jpeg"],
                                 type="filepath",
-                                file_count="single"
+                                file_count="multiple"
                             )
-                            
-                            upload_btn_process = gr.Button("🚀 Upload & Process", variant="primary", size="lg")
+
+                            upload_btn_process = gr.Button("🚀 Upload & Queue All", variant="primary", size="lg")
 
                         
                         with gr.Group():

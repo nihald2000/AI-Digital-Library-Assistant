@@ -128,7 +128,7 @@ Notes:
 | `INGEST_DEFAULT_CONCURRENCY` | 4 | Parallelism for directory ingestion |
 | `INGEST_QUEUE_ENABLED` | true | Persistent background worker queue for bulk ingests |
 | `INGEST_QUEUE_POLL_SECONDS` | 1.0 | Worker poll interval for pending jobs |
-| `INGEST_QUEUE_MAX_CONCURRENT_JOBS` | 1 | Jobs processed simultaneously by the worker |
+| `INGEST_QUEUE_MAX_CONCURRENT_JOBS` | 1 | Jobs processed simultaneously by the worker (bump to 2-3 on larger CPUs; embeddings are CPU-bound so gains come from API-legs, not worker count) |
 | `PII_MASKING_ENABLED` | true | Master switch: mask PII before the LLM sees it |
 | `PII_IN_ENABLED` | true | India entities (Aadhaar, PAN, GSTIN, IFSC, phone, passport) |
 | `PII_US_ENABLED` | true | US entities (SSN, ITIN, phone, ZIP, routing, DL) |
@@ -163,6 +163,27 @@ Notes:
 - BM25 snowball index freezes while the maintenance lock rebuilds it; the dense leg continues serving.
 
 ## PII protection & ingestion queue
+
+### Ingestion speed reality (be straight about the numbers)
+Typical paper ≈ 30-60 chunks. "1M documents in 1 minute" would mean ~16,700
+documents/s ≈ 500k-1M chunk embeddings/s. No single box - Space or GPU server -
+embeds at that rate today; packet throughput like that is a distributed-cluster
+problem (hundreds of GPUs or precomputed embeddings installed as a snapshot).
+What this stack delivers, honestly:
+
+| Path | Throughput (chunks/s) | 1M docs (~30M chunks) |
+|---|---|---|
+| HF Space cpu-basic, local 270m | ~0.8-1.7 | weeks - fine for incremental libraries |
+| Desktop CPU, local 270m | ~1.7 | weeks |
+| OpenAI-style API leg (`EMBEDDING_CONCURRENCY=8`, batch 256) | ~200-800+ | ~12-24 h when paid credits exist |
+| One A100/H100-worker subprocess running the 0.6b/270m in fp16 | ~50-150 | days; combined with the API leg for mixed workloads |
+| Distributed cluster (8+ GPUs / many API workers) | thousands | ~1-3 h |
+
+Levers already wired: multi-file upload (all files enqueue at once), the
+persistent queue (crash-safe resume + job progress), `EMBEDDING_CONCURRENCY`
++ `EMBEDDING_BATCH_SIZE` for the API leg, and `INGEST_QUEUE_MAX_CONCURRENT_JOBS`.
+The realistic 2026 path to very-large libraries: ingest continuously with the
+queue (API leg when credits exist), or attach a GPU runner for the local model.
 
 ### PII boundary (agent never sees raw sensitive data)
 - Detection runs at every LLM boundary (`GenerativeTool.answer_question`, `summarize`): question + retrieval
